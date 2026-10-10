@@ -1,0 +1,76 @@
+{
+  "confluence": {
+    "base_url": "https://confluence.example.intern",
+    "api_mode": "server",
+    "sleep_seconds": 1.0,
+    "aliases": [],
+    "auth": {
+      "type": "bearer",
+      "username": "",
+      "token": ""
+    }
+  },
+  "jira": {
+    "base_url": "https://jira.example.intern",
+    "api_mode": "server_v2",
+    "sleep_seconds": 1.0,
+    "aliases": [],
+    "project_keys": [],
+    "auth": {
+      "type": "bearer",
+      "username": "",
+      "token": ""
+    }
+  },
+  "http": {
+    "verify_ssl": false,
+    "ca_bundle": "",
+    "use_system_proxy": true,
+    "max_response_mb": 20,
+    "user_agent": "local-knowledge/1.0"
+  },
+  "crawl_defaults": {
+    "start_page": "",
+    "max_confluence_pages": 100,
+    "max_jira_issues": 100,
+    "max_total_documents": 200,
+    "max_confluence_depth": 2,
+    "max_jira_link_hops": 1,
+    "max_links_per_document": 100,
+    "max_api_requests": 1000,
+    "max_duration_minutes": 60,
+    "include_child_pages": true,
+    "follow_confluence_links": true,
+    "index_linked_jira_issues": true,
+    "follow_jira_issue_links": true,
+    "follow_jira_to_confluence": false,
+    "scan_plain_text_issue_keys": false,
+    "include_remote_links": true,
+    "resolve_page_titles": true,
+    "refresh_existing": false,
+    "request_timeout_seconds": 20,
+    "max_retries": 4
+  },
+  "index": {
+    "chunk_target_chars": 1200,
+    "chunk_overlap_chars": 150,
+    "min_chunk_chars": 80,
+    "max_document_chars": 2000000
+  },
+  "search": {
+    "max_results": 10,
+    "max_query_chars": 200
+  },
+  "graph": {
+    "max_visible_nodes": 150,
+    "default_hops": 1,
+    "max_hops": 3
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "database": {
+    "path": "data/knowledge.sqlite"
+  }
+}

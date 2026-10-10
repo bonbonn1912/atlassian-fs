@@ -20,8 +20,7 @@ from .models import (
 )
 
 SCHEMA_V1 = """
-CREATE TABLE IF NOT EXISTS documents (
-  id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE,
+CREATE TABLE IF NOT EXISTS documents (\n  id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE,
   source_type TEXT NOT NULL CHECK(source_type IN ('confluence','jira')),
   source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
   url TEXT NOT NULL DEFAULT '', space_or_project TEXT,
@@ -304,6 +303,15 @@ def get_outgoing_links(conn: sqlite3.Connection, uid: str) -> list[LinkTarget]:
     return [LinkTarget(uid=r["uid"], kind=r["kind"], relation_label=r["relation_label"],
                        source_field=r["source_field"], anchor_text=r["anchor_text"],
                        evidence_url=r["evidence_url"], title_hint=r["title"]) for r in rows]
+
+
+def get_existing_document_uids(conn: sqlite3.Connection) -> list[str]:
+    """Return all UIDs of documents that have been previously indexed or had errors."""
+    rows = conn.execute(
+        "SELECT uid FROM documents WHERE state IN (?, ?) ORDER BY id ASC",
+        (STATE_INDEXED, STATE_ERROR),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 # ----------------------------------------------------------------- jobs

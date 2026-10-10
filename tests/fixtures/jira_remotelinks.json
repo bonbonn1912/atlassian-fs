@@ -1,0 +1,16 @@
+[
+  {
+    "id": 101,
+    "object": {
+      "url": "https://confluence.intern/display/ENG/Architecture+Overview",
+      "title": "Architecture Overview Page"
+    }
+  },
+  {
+    "id": 102,
+    "object": {
+      "url": "https://external.example.com/some/article",
+      "title": "External Article"
+    }
+  }
+]

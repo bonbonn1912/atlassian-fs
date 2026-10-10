@@ -1,0 +1,35 @@
+<p>Introduction paragraph before any heading.</p>
+<h1>System Overview</h1>
+<p>Here is an architectural overview of our systems.</p>
+<h2>Confluence Links</h2>
+<p>Internal page link: <ac:link><ri:page ri:space-key="ENG" ri:content-title="Architecture Guide"/><ac:plain-text-link-body><![CDATA[Read the Arch Guide]]></ac:plain-text-link-body></ac:link></p>
+<p>Default space link without ri:space-key: <ac:link><ri:page ri:content-title="Local Notes"/></ac:link></p>
+<p>Content entity by ID: <ac:link><ri:content-entity ri:content-id="98765"/><ac:plain-text-link-body><![CDATA[Page 98765]]></ac:plain-text-link-body></ac:link></p>
+<p>Page by ID attribute: <ac:link><ri:page ri:content-id="54321" ri:content-title="Ignored Title"/></ac:link></p>
+<p>Standard HTML link: <a href="/display/ENG/M%C3%BCnchen+Office">München Office</a></p>
+<p>Relative viewpage link: <a href="/pages/viewpage.action?pageId=112233">Action Page</a></p>
+<p>Foreign external link: <a href="https://external-site.com/docs">External Docs</a></p>
+
+<h2>Jira Integration</h2>
+<p>Single issue macro: <ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">PROJ-42</ac:parameter></ac:structured-macro></p>
+<p>Macro with JQL query to ignore: <ac:structured-macro ac:name="jira"><ac:parameter ac:name="jqlQuery">project = PROJ</ac:parameter></ac:structured-macro></p>
+<p>HTML link to Jira issue: <a href="https://jira.intern/browse/PROJ-99">Bug 99</a></p>
+
+<h2>Code Example</h2>
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">python</ac:parameter>
+  <ac:plain-text-body><![CDATA[def calculate(a, b):
+    # Sum values
+    return a + b]]></ac:plain-text-body>
+</ac:structured-macro>
+
+<h2>Data Table</h2>
+<table>
+  <thead>
+    <tr><th>Component</th><th>Status</th><th>Owner</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Frontend</td><td>Active</td><td>Alice</td></tr>
+    <tr><td>Backend</td><td>Maintenance</td><td>Bob</td></tr>
+  </tbody>
+</table>

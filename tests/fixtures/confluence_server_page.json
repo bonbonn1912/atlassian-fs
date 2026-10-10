@@ -1,0 +1,27 @@
+{
+  "id": "12345",
+  "type": "page",
+  "title": "Architecture Overview",
+  "space": {
+    "key": "ENG",
+    "name": "Engineering"
+  },
+  "version": {
+    "number": 3,
+    "when": "2026-03-15T10:00:00.000Z"
+  },
+  "history": {
+    "lastUpdated": {
+      "when": "2026-03-15T10:00:00.000Z"
+    }
+  },
+  "body": {
+    "storage": {
+      "value": "<p>Architecture documentation for project</p><p><a href=\"https://jira.intern/browse/PROJ-101\">Issue PROJ-101</a></p>",
+      "representation": "storage"
+    }
+  },
+  "_links": {
+    "webui": "/display/ENG/Architecture+Overview"
+  }
+}

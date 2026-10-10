@@ -1,0 +1,80 @@
+{
+  "id": "50001",
+  "key": "PROJ-101",
+  "fields": {
+    "summary": "Implement Knowledge Graph Service",
+    "description": "h1. Overview\nWe need to build a knowledge graph service.\nSee [DOC-1|https://confluence.intern/pages/viewpage.action?pageId=12345].",
+    "status": {
+      "name": "In Progress"
+    },
+    "issuetype": {
+      "name": "Story"
+    },
+    "project": {
+      "key": "PROJ",
+      "name": "Project"
+    },
+    "labels": [
+      "backend",
+      "search"
+    ],
+    "components": [
+      {
+        "name": "API"
+      },
+      {
+        "name": "Database"
+      }
+    ],
+    "created": "2026-03-01T09:00:00.000+0100",
+    "updated": "2026-03-10T14:30:00.000+0100",
+    "parent": {
+      "id": "50000",
+      "key": "PROJ-100",
+      "fields": {
+        "summary": "Epic: Knowledge Platform"
+      }
+    },
+    "subtasks": [
+      {
+        "id": "50002",
+        "key": "PROJ-102",
+        "fields": {
+          "summary": "Subtask: Database tables"
+        }
+      }
+    ],
+    "issuelinks": [
+      {
+        "id": "9001",
+        "type": {
+          "name": "Relates",
+          "inward": "is related to",
+          "outward": "relates to"
+        },
+        "outwardIssue": {
+          "id": "50010",
+          "key": "PROJ-200",
+          "fields": {
+            "summary": "Frontend Search UI"
+          }
+        }
+      },
+      {
+        "id": "9002",
+        "type": {
+          "name": "Blocks",
+          "inward": "is blocked by",
+          "outward": "blocks"
+        },
+        "inwardIssue": {
+          "id": "50020",
+          "key": "OPS-50",
+          "fields": {
+            "summary": "Provision SQLite storage"
+          }
+        }
+      }
+    ]
+  }
+}

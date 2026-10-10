@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "id": "12346",
+      "type": "page",
+      "title": "Backend Service"
+    },
+    {
+      "id": "12347",
+      "type": "page",
+      "title": "Frontend Client"
+    }
+  ],
+  "start": 0,
+  "limit": 2,
+  "size": 2,
+  "_links": {
+    "next": "/rest/api/content/12345/child/page?start=2&limit=2"
+  }
+}

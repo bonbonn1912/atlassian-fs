@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lokaler Knowledge Graph · Confluence &amp; Jira</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="graph-layout-worker.js"></script>
+  <script defer src="graph.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div class="app-layout">
+    <header class="app-header">
+      <div class="header-brand">
+        <div class="brand-icon" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="6" cy="6" r="3"></circle>
+            <circle cx="18" cy="8" r="3"></circle>
+            <circle cx="12" cy="18" r="3"></circle>
+            <line x1="8.5" y1="7.5" x2="15.5" y2="6.5"></line>
+            <line x1="7.5" y1="8.5" x2="10.5" y2="15.5"></line>
+            <line x1="16.5" y1="10.5" x2="13.5" y2="15.5"></line>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1 class="brand-title">Knowledge Graph</h1>
+          <span class="brand-subtitle">Confluence &amp; Jira</span>
+        </div>
+      </div>
+
+      <nav class="header-nav" aria-label="Hauptnavigation">
+        <div class="nav-tablist" role="tablist">
+          <button type="button" role="tab" id="tab-search" class="nav-tab" aria-selected="true" aria-controls="panel-search" tabindex="0">
+            <span class="tab-label">Suche</span>
+          </button>
+          <button type="button" role="tab" id="tab-index" class="nav-tab" aria-selected="false" aria-controls="panel-index" tabindex="-1">
+            <span class="tab-label">Indexierung</span>
+            <span class="tab-badge job-running-indicator" id="job-active-indicator" hidden aria-label="Job läuft"></span>
+          </button>
+          <button type="button" role="tab" id="tab-graph" class="nav-tab" aria-selected="false" aria-controls="panel-graph" tabindex="-1">
+            <span class="tab-label">Graph</span>
+          </button>
+          <button type="button" role="tab" id="tab-settings" class="nav-tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1">
+            <span class="tab-label">Einstellungen</span>
+          </button>
+        </div>
+      </nav>
+
+      <div class="header-meta">
+        <span class="meta-stat" id="header-doc-count" title="Indexierte Dokumente">0 Dokumente</span>
+      </div>
+    </header>
+
+    <div class="global-banner-container" id="global-banners" aria-live="polite">
+      <!-- Banners such as missing Confluence config dynamically inserted here -->
+    </div>
+
+    <main class="app-main">
+      <!-- TAB 1: SUCHE -->
+      <section role="tabpanel" id="panel-search" class="tab-panel active" aria-labelledby="tab-search" tabindex="0">
+        <div class="search-view-container" id="search-view-container">
+          <div class="search-hero" id="search-hero">
+            <h2 class="search-hero-title">Lokale Wissenssuche</h2>
+            <p class="search-hero-desc">Durchsuche lokal indexierte Confluence-Seiten und Jira-Tickets in Echtzeit.</p>
+          </div>
+
+          <form class="search-form" id="search-form" role="search" novalidate>
+            <div class="search-input-wrapper">
+              <label for="search-input" class="sr-only">Suchbegriff</label>
+              <svg class="search-icon" aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              <input type="search" id="search-input" class="search-input" placeholder="Suchbegriff, Jira-Key (z. B. ENG-42) oder Titel eingeben …" autocomplete="off" spellcheck="false" maxlength="200">
+              <button type="button" class="search-clear-btn" id="search-clear-btn" hidden aria-label="Suche löschen">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+              <button type="submit" class="btn btn-primary search-submit-btn">Suchen</button>
+            </div>
+
+            <div class="search-filters-row">
+              <div class="filter-group">
+                <span class="filter-label">Quelle:</span>
+                <div class="segmented-control" role="radiogroup" aria-label="Typfilter">
+                  <input type="radio" name="search-type" id="search-type-all" value="all" checked>
+                  <label for="search-type-all">Alle</label>
+
+                  <input type="radio" name="search-type" id="search-type-confluence" value="confluence">
+                  <label for="search-type-confluence">Confluence</label>
+
+                  <input type="radio" name="search-type" id="search-type-jira" value="jira">
+                  <label for="search-type-jira">Jira</label>
+                </div>
+              </div>
+
+              <div class="filter-group">
+                <label for="search-project-select" class="filter-label">Space / Projekt:</label>
+                <select id="search-project-select" class="select-input">
+                  <option value="">Alle Spaces &amp; Projekte</option>
+                </select>
+              </div>
+            </div>
+          </form>
+
+          <div class="search-results-container" id="search-results-container">
+            <div class="search-meta-bar" id="search-meta-bar" hidden aria-live="polite">
+              <span class="search-meta-count" id="search-meta-count"></span>
+            </div>
+
+            <div class="search-status-area" id="search-status-area" aria-live="polite">
+              <!-- Empty state or error notices inserted here -->
+            </div>
+
+            <ul class="results-list" id="results-list" aria-label="Suchergebnisse">
+              <!-- Dynamically populated -->
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: INDEXIERUNG -->
+      <section role="tabpanel" id="panel-index" class="tab-panel" aria-labelledby="tab-index" tabindex="0" hidden>
+        <div class="indexing-container">
+          <div class="indexing-header-row">
+            <div>
+              <h2 class="section-title">Indexierung &amp; Crawl-Verwaltung</h2>
+              <p class="section-desc">Starte und überwache lokale Indexierungs-Jobs für Confluence-Bereiche und Jira-Tickets.</p>
+            </div>
+            <div class="indexing-header-actions">
+              <button type="button" class="btn btn-secondary" id="job-refresh-existing-btn" title="Aktualisiert nur bereits indexierte Dokumente aus Confluence/Jira">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-right: 6px;"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                Bestehende aktualisieren (Refresh existing)
+              </button>
+            </div>
+          </div>
+
+          <!-- Stats Tiles -->
+          <div class="stats-tiles-grid" id="stats-tiles-grid">
+            <div class="stat-card">
+              <div class="stat-label">Dokumente gesamt</div>
+              <div class="stat-value" id="stat-docs-total">—</div>
+              <div class="stat-subtext" id="stat-docs-breakdown">Confluence: — · Jira: —</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Beziehungen (Kanten)</div>
+              <div class="stat-value" id="stat-edges-total">—</div>
+              <div class="stat-subtext" id="stat-edges-sub">Verknüpfte Referenzen</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">FTS-Text-Chunks</div>
+              <div class="stat-value" id="stat-chunks-total">—</div>
+              <div class="stat-subtext" id="stat-chunks-sub">Suchbare Textabschnitte</div>
+            </div>
+          </div>
+
+          <!-- Live Job Status Card -->
+          <div class="job-status-card" id="job-status-card" hidden>
+            <div class="job-status-header">
+              <div class="job-status-title-group">
+                <span class="job-status-badge badge-idle" id="job-status-badge">Bereit</span>
+                <h3 class="job-id-title" id="job-id-title">Job #—</h3>
+              </div>
+              <div class="job-header-actions">
+                <span class="job-elapsed-time" id="job-elapsed-time">Dauer: 0s</span>
+                <button type="button" class="btn btn-danger btn-sm" id="job-stop-btn" disabled>Indexierung stoppen</button>
+              </div>
+            </div>
+
+            <!-- Wait banner (rate_limit_wait) -->
+            <div class="job-wait-banner" id="job-wait-banner" hidden aria-live="assertive">
+              <div class="wait-icon" aria-hidden="true">⏳</div>
+              <div class="wait-content">
+                <div class="wait-title" id="job-wait-title">Rate-Limit Wartezeit</div>
+                <div class="wait-desc" id="job-wait-desc">Warte auf Freigabe …</div>
+              </div>
+            </div>
+
+            <!-- Live counters grid -->
+            <div class="job-counters-grid">
+              <div class="counter-item">
+                <span class="counter-label">Seiten indexiert</span>
+                <span class="counter-val" id="job-pages-indexed">0</span>
+              </div>
+              <div class="counter-item">
+                <span class="counter-label">Jira indexiert</span>
+                <span class="counter-val" id="job-jira-indexed">0</span>
+              </div>
+              <div class="counter-item">
+                <span class="counter-label">API-Requests</span>
+                <span class="counter-val" id="job-api-requests">0</span>
+              </div>
+              <div class="counter-item">
+                <span class="counter-label">Übersprungen</span>
+                <span class="counter-val" id="job-skipped">0</span>
+              </div>
+              <div class="counter-item">
+                <span class="counter-label">Fehler</span>
+                <span class="counter-val" id="job-errors">0</span>
+              </div>
+              <div class="counter-item">
+                <span class="counter-label">Queue-Größe</span>
+                <span class="counter-val" id="job-queue-size">0</span>
+              </div>
+            </div>
+
+            <!-- Current UID & Message -->
+            <div class="job-info-row">
+              <span class="info-tag">Aktuelle UID:</span>
+              <span class="info-val" id="job-current-uid">—</span>
+            </div>
+            <div class="job-info-row">
+              <span class="info-tag">Letzte Meldung:</span>
+              <span class="info-val" id="job-last-message">—</span>
+            </div>
+
+            <!-- Budgets (used / max bars) -->
+            <div class="job-budgets-section">
+              <h4 class="budgets-title">Budgetauslastung</h4>
+              <div class="budgets-list" id="job-budgets-list">
+                <!-- Dynamically rendered progress bars per budget -->
+              </div>
+            </div>
+
+            <!-- Job Log collapsible -->
+            <details class="job-log-details" id="job-log-details">
+              <summary class="log-summary">
+                <span>Job-Protokoll anzeigen (<span id="job-log-count">0</span> Einträge)</span>
+              </summary>
+              <div class="log-table-wrapper">
+                <table class="log-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Zeit</th>
+                      <th scope="col">Level</th>
+                      <th scope="col">Dokument</th>
+                      <th scope="col">Meldung</th>
+                    </tr>
+                  </thead>
+                  <tbody id="job-log-tbody">
+                    <!-- Populated dynamically -->
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          </div>
+
+          <!-- Job Start Form -->
+          <div class="card form-card">
+            <form id="indexing-form" novalidate>
+              <div class="form-header">
+                <h3 class="form-title">Neuen Indexierungs-Job starten</h3>
+                <p class="form-desc">Passe die Parameter an und starte den Crawl-Worker.</p>
+              </div>
+
+              <div class="form-feedback" id="indexing-feedback" aria-live="polite"></div>
+
+              <!-- Group 1: Start -->
+              <fieldset class="form-fieldset">
+                <legend class="fieldset-legend">Einstieg</legend>
+                <div class="form-group">
+                  <label for="job-start-page" class="field-label">Confluence-Start-URL oder Page-ID <span class="required-mark" aria-hidden="true">*</span></label>
+                  <input type="text" id="job-start-page" name="start_page" class="text-input" placeholder="z. B. https://confluence.intern/display/SPACE/Titel oder 12345" required>
+                  <span class="field-hint">Vollständige URL einer Confluence-Seite oder numerische Page-ID.</span>
+                </div>
+              </fieldset>
+
+              <!-- Group 2: Mengengrenzen -->
+              <fieldset class="form-fieldset">
+                <legend class="fieldset-legend">Mengengrenzen &amp; Budgets</legend>
+                <div class="form-grid-3">
+                  <div class="form-group">
+                    <label for="job-max-confluence-pages" class="field-label">Max. Confluence-Seiten</label>
+                    <input type="number" id="job-max-confluence-pages" name="max_confluence_pages" class="number-input">
+                    <span class="field-hint">Grenze erfolgreicher Seitenabrufe</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-max-jira-issues" class="field-label">Max. Jira-Tickets</label>
+                    <input type="number" id="job-max-jira-issues" name="max_jira_issues" class="number-input">
+                    <span class="field-hint">Grenze erfolgreicher Ticketabrufe</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-max-total-documents" class="field-label">Max. Dokumente gesamt</label>
+                    <input type="number" id="job-max-total-documents" name="max_total_documents" class="number-input">
+                    <span class="field-hint">Summe beider Typen</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-max-links-per-document" class="field-label">Max. Links je Dokument</label>
+                    <input type="number" id="job-max-links-per-document" name="max_links_per_document" class="number-input">
+                    <span class="field-hint">Begrenzt neu eingeplante Ziele</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-max-api-requests" class="field-label">Max. API-Requests</label>
+                    <input type="number" id="job-max-api-requests" name="max_api_requests" class="number-input">
+                    <span class="field-hint">Alle Versuche inkl. Retries</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-max-duration-minutes" class="field-label">Max. Dauer (Minuten)</label>
+                    <input type="number" id="job-max-duration-minutes" name="max_duration_minutes" class="number-input">
+                    <span class="field-hint">Zeitbudget inkl. Wartezeiten</span>
+                  </div>
+                </div>
+              </fieldset>
+
+              <!-- Group 3: Crawl-Tiefe & Hops -->
+              <fieldset class="form-fieldset">
+                <legend class="fieldset-legend">Crawl-Tiefe &amp; Verknüpfungen</legend>
+                <div class="form-grid-2">
+                  <div class="form-group">
+                    <label for="job-max-confluence-depth" class="field-label">Confluence-Tiefe</label>
+                    <input type="number" id="job-max-confluence-depth" name="max_confluence_depth" class="number-input">
+                    <span class="field-hint">Startseite = 0; BFS über Seitenlinks und Kinder</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-max-jira-link-hops" class="field-label">Jira-Link-Hops</label>
+                    <input type="number" id="job-max-jira-link-hops" name="max_jira_link_hops" class="number-input">
+                    <span class="field-hint">Traversierung Jira-Issue → verlinktes Jira-Issue</span>
+                  </div>
+                </div>
+              </fieldset>
+
+              <!-- Group 4: Netzwerk & Rate-Limiting -->
+              <fieldset class="form-fieldset">
+                <legend class="fieldset-legend">Netzwerk &amp; Rate-Limiting</legend>
+                <div class="form-grid-2">
+                  <div class="form-group">
+                    <label for="job-confluence-sleep-seconds" class="field-label">Confluence-Sleep (s)</label>
+                    <input type="number" id="job-confluence-sleep-seconds" name="confluence_sleep_seconds" class="number-input" step="0.1">
+                    <span class="field-hint">Mindestabstand zwischen Confluence-Requests</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-jira-sleep-seconds" class="field-label">Jira-Sleep (s)</label>
+                    <input type="number" id="job-jira-sleep-seconds" name="jira_sleep_seconds" class="number-input" step="0.1">
+                    <span class="field-hint">Mindestabstand zwischen Jira-Requests</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-request-timeout-seconds" class="field-label">Request-Timeout (s)</label>
+                    <input type="number" id="job-request-timeout-seconds" name="request_timeout_seconds" class="number-input" step="0.5">
+                    <span class="field-hint">Timeout pro HTTP-Aufruf</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-max-retries" class="field-label">Max. Retries</label>
+                    <input type="number" id="job-max-retries" name="max_retries" class="number-input">
+                    <span class="field-hint">Wiederholungsversuche bei 429/5xx</span>
+                  </div>
+                </div>
+              </fieldset>
+
+              <!-- Group 5: Traversierungsoptionen (Checkboxes) -->
+              <fieldset class="form-fieldset">
+                <legend class="fieldset-legend">Traversierungsoptionen</legend>
+                <div class="checkboxes-grid">
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-include-child-pages" name="include_child_pages">
+                    <span class="checkbox-label">Unterseiten berücksichtigen (Child-Pages abrufen)</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-follow-confluence-links" name="follow_confluence_links">
+                    <span class="checkbox-label">Confluence-Links folgen (explizite Seitenlinks)</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-index-linked-jira-issues" name="index_linked_jira_issues">
+                    <span class="checkbox-label">Jira-Tickets indexieren (verlinkte Issues abrufen)</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-follow-jira-issue-links" name="follow_jira_issue_links">
+                    <span class="checkbox-label">Jira-Issue-Links folgen (Parent, Subtasks, Links)</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-follow-jira-to-confluence" name="follow_jira_to_confluence">
+                    <span class="checkbox-label">Jira → Confluence folgen (Rücklinks verfolgen)</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-scan-plain-text-issue-keys" name="scan_plain_text_issue_keys">
+                    <span class="checkbox-label">Issue-Keys aus Fließtext erkennen</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-include-remote-links" name="include_remote_links">
+                    <span class="checkbox-label">Jira-Remote-Links abrufen</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-resolve-page-titles" name="resolve_page_titles">
+                    <span class="checkbox-label">Titel-Links auflösen (/display/… auflösen)</span>
+                  </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-refresh-existing" name="refresh_existing">
+                    <span class="checkbox-label">Bestehende Inhalte aktualisieren</span>
+                  </label>
+                </div>
+              </fieldset>
+
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary" id="job-start-btn">Indexierung starten</button>
+                <button type="button" class="btn btn-secondary" id="job-refresh-existing-form-btn" title="Nur vorhandene Dokumente neu abrufen und aktualisieren">Bestehende aktualisieren (Refresh existing)</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: GRAPH -->
+      <section role="tabpanel" id="panel-graph" class="tab-panel" aria-labelledby="tab-graph" tabindex="0" hidden>
+        <div class="graph-layout-container">
+          <!-- Graph Toolbar -->
+          <div class="graph-toolbar" role="toolbar" aria-label="Graph Werkzeugleiste">
+            <form class="graph-center-form" id="graph-center-form" novalidate>
+              <label for="graph-center-input" class="sr-only">Zentrum-Knoten oder Freitextsuche</label>
+              <input type="text" id="graph-center-input" class="text-input graph-center-input" placeholder="Zentrum: UID (z. B. jira:ENG-42) oder Suchbegriff …">
+              <button type="submit" class="btn btn-secondary btn-sm">Laden</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="graph-overview-btn" title="Zeigt die am stärksten verknüpften Knoten">Übersicht</button>
+            </form>
+
+            <div class="graph-toolbar-divider" aria-hidden="true"></div>
+
+            <div class="graph-control-item">
+              <label for="graph-hops-select" class="toolbar-label">Hops:</label>
+              <select id="graph-hops-select" class="select-input select-sm">
+                <option value="0">0 (Nur Zentrum)</option>
+                <option value="1" selected>1 (Direkte Nachbarn)</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+              </select>
+            </div>
+
+            <div class="graph-control-item">
+              <label for="graph-max-nodes-input" class="toolbar-label">Max. Knoten:</label>
+              <input type="number" id="graph-max-nodes-input" class="number-input number-sm" value="5000" min="10" max="20000">
+            </div>
+
+            <div class="graph-control-item">
+              <label for="graph-type-filter" class="toolbar-label">Typ:</label>
+              <select id="graph-type-filter" class="select-input select-sm">
+                <option value="all" selected>Alle</option>
+                <option value="confluence">Nur Confluence</option>
+                <option value="jira">Nur Jira</option>
+              </select>
+            </div>
+
+            <div class="graph-toolbar-divider" aria-hidden="true"></div>
+
+            <!-- Edge Kinds dropdown or popover -->
+            <details class="edge-filters-details" id="edge-filters-details">
+              <summary class="btn btn-ghost btn-sm">Kantenarten (<span id="edge-filters-active-count">6</span>)</summary>
+              <div class="edge-filters-dropdown">
+                <label class="checkbox-control checkbox-sm">
+                  <input type="checkbox" id="edge-filter-links_to" value="links_to" checked>
+                  <span>Link (links_to)</span>
+                </label>
+                <label class="checkbox-control checkbox-sm">
+                  <input type="checkbox" id="edge-filter-parent_of" value="parent_of" checked>
+                  <span>Kindseite (parent_of)</span>
+                </label>
+                <label class="checkbox-control checkbox-sm">
+                  <input type="checkbox" id="edge-filter-mentions_jira" value="mentions_jira" checked>
+                  <span>Jira-Erwähnung (mentions_jira)</span>
+                </label>
+                <label class="checkbox-control checkbox-sm">
+                  <input type="checkbox" id="edge-filter-jira_relates_to" value="jira_relates_to" checked>
+                  <span>Jira-Verknüpfung (jira_relates_to)</span>
+                </label>
+                <label class="checkbox-control checkbox-sm">
+                  <input type="checkbox" id="edge-filter-jira_parent_of" value="jira_parent_of" checked>
+                  <span>Jira-Hierarchie (jira_parent_of)</span>
+                </label>
+                <label class="checkbox-control checkbox-sm">
+                  <input type="checkbox" id="edge-filter-links_to_confluence" value="links_to_confluence" checked>
+                  <span>Jira → Confluence (links_to_confluence)</span>
+                </label>
+              </div>
+            </details>
+
+            <div class="graph-toolbar-spacer"></div>
+
+            <div class="graph-zoom-controls">
+              <button type="button" class="btn btn-ghost btn-icon" id="graph-zoom-in" title="Vergrößern (+)" aria-label="Vergrößern">+</button>
+              <button type="button" class="btn btn-ghost btn-icon" id="graph-zoom-out" title="Verkleinern (−)" aria-label="Verkleinern">−</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="graph-fit-btn" title="Ausschnitt zentrieren">Zentrieren</button>
+            </div>
+          </div>
+
+          <!-- Truncated notification banner -->
+          <div class="graph-banner" id="graph-banner" hidden aria-live="polite">
+            <span class="banner-icon" aria-hidden="true">ℹ</span>
+            <span id="graph-banner-text">Weitere Knoten ausgeblendet. Erhöhe „Max. Knoten“ oder verringere Hops.</span>
+          </div>
+
+          <!-- Main workspace: SVG Canvas + Inspector -->
+          <div class="graph-workspace">
+            <div class="graph-canvas-container" id="graph-canvas-container">
+              <canvas id="graph-canvas" class="graph-canvas" tabindex="0" role="application"
+                      aria-label="Knowledge Graph. Pfeiltasten wählen Knoten, Enter lädt als Zentrum, Plus/Minus zoomt, 0 zeigt alles."></canvas>
+
+              <!-- Graph Legend Overlay -->
+              <div class="graph-legend" id="graph-legend" aria-label="Graph Legende">
+                <div class="legend-title">Legende</div>
+                <div class="legend-row">
+                  <span class="legend-swatch node-confluence"></span>
+                  <span>Confluence (Seite)</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-swatch node-jira"></span>
+                  <span>Jira (Ticket)</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-swatch node-reference"></span>
+                  <span>Nicht indexiert (Referenz)</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-swatch node-error"></span>
+                  <span>Fehler / Nicht gefunden</span>
+                </div>
+                <div class="legend-divider"></div>
+                <div class="legend-row">
+                  <span class="legend-line edge-links-to"></span>
+                  <span>Link / Verweis</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-line edge-parent-of"></span>
+                  <span>Kindseite (dick)</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-line edge-jira"></span>
+                  <span>Jira-Beziehung (orange)</span>
+                </div>
+              </div>
+
+              <!-- Loading overlay -->
+              <div class="graph-loading-overlay" id="graph-loading-overlay" hidden>
+                <div class="spinner" aria-hidden="true"></div>
+                <span id="graph-loading-text">Graph wird berechnet …</span>
+              </div>
+            </div>
+
+            <!-- Inspector Sidebar -->
+            <aside class="graph-inspector" id="graph-inspector" aria-label="Element-Inspektor">
+              <div class="inspector-header">
+                <h3 class="inspector-title" id="inspector-title">Inspektor</h3>
+                <button type="button" class="btn btn-ghost btn-sm btn-icon" id="inspector-close-btn" aria-label="Inspektor schließen">✕</button>
+              </div>
+
+              <div class="inspector-content" id="inspector-content">
+                <div class="inspector-empty-state" id="inspector-empty-state">
+                  <p>Klicke auf einen Knoten oder eine Kante im Graphen, um Details anzuzeigen.</p>
+                </div>
+
+                <div class="inspector-details" id="inspector-details" hidden>
+                  <!-- Populated via createElement/textContent -->
+                </div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: EINSTELLUNGEN -->
+      <section role="tabpanel" id="panel-settings" class="tab-panel" aria-labelledby="tab-settings" tabindex="0" hidden>
+        <div class="settings-container">
+          <div class="settings-header-row">
+            <div>
+              <h2 class="section-title">Einstellungen</h2>
+              <p class="section-desc">Konfiguriere Basis-URLs, Authentifizierung, HTTP/TLS-Parameter und Standards für deine self-hosted Instanz.</p>
+            </div>
+            <div class="settings-top-actions">
+              <button type="button" class="btn btn-secondary" id="settings-test-btn">Verbindung testen</button>
+              <button type="button" class="btn btn-primary" id="settings-save-btn">Einstellungen speichern</button>
+            </div>
+          </div>
+
+          <div class="form-feedback" id="settings-feedback" aria-live="polite"></div>
+          <div class="test-results-box" id="settings-test-results" hidden aria-live="polite"></div>
+
+          <form id="settings-form" novalidate>
+            <!-- Confluence Configuration -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">Confluence-Instanz</legend>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-confluence-base-url" class="field-label">Basis-URL</label>
+                  <input type="url" id="setting-confluence-base-url" class="text-input" placeholder="https://confluence.intern oder https://intern/confluence">
+                  <span class="field-hint">Web-Wurzel ohne Slash am Ende.</span>
+                </div>
+                <div class="form-group">
+                  <label for="setting-confluence-api-mode" class="field-label">API-Modus</label>
+                  <select id="setting-confluence-api-mode" class="select-input">
+                    <option value="server">Server / Data Center (REST /rest/api/content)</option>
+                    <option value="cloud_v2">Cloud (REST v2)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="setting-confluence-aliases" class="field-label">Weitere Basis-URLs (Aliase)</label>
+                <textarea id="setting-confluence-aliases" class="textarea-input" rows="2" placeholder="https://altes-confluence.intern&#10;https://wiki.intern"></textarea>
+                <span class="field-hint">Eine URL pro Zeile. Links darauf werden erkannt; API-Requests gehen immer an die Basis-URL.</span>
+              </div>
+
+              <div class="form-grid-3">
+                <div class="form-group">
+                  <label for="setting-confluence-sleep-seconds" class="field-label">Sleep (Sekunden)</label>
+                  <input type="number" id="setting-confluence-sleep-seconds" class="number-input" step="0.1" min="0" max="120">
+                </div>
+                <div class="form-group">
+                  <label for="setting-confluence-auth-type" class="field-label">Authentifizierung</label>
+                  <select id="setting-confluence-auth-type" class="select-input">
+                    <option value="none">Keine (none)</option>
+                    <option value="bearer">Bearer / Personal Access Token (PAT)</option>
+                    <option value="basic">Basic Auth (Benutzername &amp; Passwort/Token)</option>
+                  </select>
+                </div>
+                <div class="form-group" id="group-confluence-username" hidden>
+                  <label for="setting-confluence-username" class="field-label">Benutzername</label>
+                  <input type="text" id="setting-confluence-username" class="text-input" autocomplete="off">
+                </div>
+              </div>
+
+              <div class="form-group" id="group-confluence-token">
+                <label for="setting-confluence-token" class="field-label">Token / Passwort</label>
+                <div class="input-with-action">
+                  <input type="password" id="setting-confluence-token" class="text-input" autocomplete="off" placeholder="Neues Token eingeben …">
+                  <span class="token-status-badge" id="setting-confluence-token-status" hidden>Gespeichert</span>
+                  <button type="button" class="btn btn-ghost btn-sm" id="setting-confluence-token-clear" hidden>Token entfernen</button>
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- Jira Configuration -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">Jira-Instanz</legend>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-jira-base-url" class="field-label">Basis-URL</label>
+                  <input type="url" id="setting-jira-base-url" class="text-input" placeholder="https://jira.intern">
+                  <span class="field-hint">Web-Wurzel ohne Slash am Ende.</span>
+                </div>
+                <div class="form-group">
+                  <label for="setting-jira-api-mode" class="field-label">API-Modus</label>
+                  <select id="setting-jira-api-mode" class="select-input">
+                    <option value="server_v2">Server / Data Center (REST /rest/api/2)</option>
+                    <option value="cloud_v3">Cloud (REST v3)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-jira-aliases" class="field-label">Weitere Basis-URLs (Aliase)</label>
+                  <textarea id="setting-jira-aliases" class="textarea-input" rows="2" placeholder="https://altes-jira.intern"></textarea>
+                  <span class="field-hint">Eine URL pro Zeile.</span>
+                </div>
+                <div class="form-group">
+                  <label for="setting-jira-project-keys" class="field-label">Projekt-Keys (kommagetrennt)</label>
+                  <textarea id="setting-jira-project-keys" class="textarea-input" rows="2" placeholder="ENG, PROJ, INFRA"></textarea>
+                  <span class="field-hint">Nur für Fließtext-Erkennung. Leer = alle Keys zulässig.</span>
+                </div>
+              </div>
+
+              <div class="form-grid-3">
+                <div class="form-group">
+                  <label for="setting-jira-sleep-seconds" class="field-label">Sleep (Sekunden)</label>
+                  <input type="number" id="setting-jira-sleep-seconds" class="number-input" step="0.1" min="0" max="120">
+                </div>
+                <div class="form-group">
+                  <label for="setting-jira-auth-type" class="field-label">Authentifizierung</label>
+                  <select id="setting-jira-auth-type" class="select-input">
+                    <option value="none">Keine (none)</option>
+                    <option value="bearer">Bearer / Personal Access Token (PAT)</option>
+                    <option value="basic">Basic Auth (Benutzername &amp; Passwort/Token)</option>
+                  </select>
+                </div>
+                <div class="form-group" id="group-jira-username" hidden>
+                  <label for="setting-jira-username" class="field-label">Benutzername</label>
+                  <input type="text" id="setting-jira-username" class="text-input" autocomplete="off">
+                </div>
+              </div>
+
+              <div class="form-group" id="group-jira-token">
+                <label for="setting-jira-token" class="field-label">Token / Passwort</label>
+                <div class="input-with-action">
+                  <input type="password" id="setting-jira-token" class="text-input" autocomplete="off" placeholder="Neues Token eingeben …">
+                  <span class="token-status-badge" id="setting-jira-token-status" hidden>Gespeichert</span>
+                  <button type="button" class="btn btn-ghost btn-sm" id="setting-jira-token-clear" hidden>Token entfernen</button>
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- HTTP & TLS -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">HTTP / TLS &amp; Netzwerk</legend>
+              <div class="form-group">
+                <label class="checkbox-control">
+                  <input type="checkbox" id="setting-http-verify-ssl">
+                  <span class="checkbox-label">TLS-Zertifikate prüfen</span>
+                </label>
+                <span class="field-hint field-hint-warning">Aus = interne / self-signed Zertifikate werden akzeptiert (Standard für firmeninterne Instanzen).</span>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-http-ca-bundle" class="field-label">Eigenes CA-Bundle (Pfad zur PEM-Datei)</label>
+                  <input type="text" id="setting-http-ca-bundle" class="text-input" placeholder="/pfad/zu/ca-bundle.pem" disabled>
+                  <span class="field-hint">Wird nur verwendet, wenn Zertifikatsprüfung aktiviert ist.</span>
+                </div>
+                <div class="form-group">
+                  <label class="checkbox-control checkbox-margin-top">
+                    <input type="checkbox" id="setting-http-use-system-proxy">
+                    <span class="checkbox-label">System-Proxy verwenden (HTTP(S)_PROXY / NO_PROXY)</span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-http-max-response-mb" class="field-label">Max. Antwortgröße (MB)</label>
+                  <input type="number" id="setting-http-max-response-mb" class="number-input" min="1" max="500">
+                </div>
+                <div class="form-group">
+                  <label for="setting-http-user-agent" class="field-label">User-Agent</label>
+                  <input type="text" id="setting-http-user-agent" class="text-input">
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- Index- & Chunking-Parameter -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">Indexierung &amp; Textzerlegung (Chunks)</legend>
+              <div class="form-grid-4">
+                <div class="form-group">
+                  <label for="setting-index-chunk-target-chars" class="field-label">Zielgröße Chunk (Zeichen)</label>
+                  <input type="number" id="setting-index-chunk-target-chars" class="number-input">
+                </div>
+                <div class="form-group">
+                  <label for="setting-index-chunk-overlap-chars" class="field-label">Overlap (Zeichen)</label>
+                  <input type="number" id="setting-index-chunk-overlap-chars" class="number-input">
+                </div>
+                <div class="form-group">
+                  <label for="setting-index-min-chunk-chars" class="field-label">Min. Chunkgröße</label>
+                  <input type="number" id="setting-index-min-chunk-chars" class="number-input">
+                </div>
+                <div class="form-group">
+                  <label for="setting-index-max-document-chars" class="field-label">Max. Dokumentgröße</label>
+                  <input type="number" id="setting-index-max-document-chars" class="number-input">
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- Such- und Graphparameter -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">Suche &amp; Graph-Standardwerte</legend>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-search-max-results" class="field-label">Max. Suchergebnisse (1–10)</label>
+                  <input type="number" id="setting-search-max-results" class="number-input" min="1" max="10">
+                </div>
+                <div class="form-group">
+                  <label for="setting-search-max-query-chars" class="field-label">Max. Suchanfragelänge (Zeichen)</label>
+                  <input type="number" id="setting-search-max-query-chars" class="number-input" min="10" max="1000">
+                </div>
+                <div class="form-group">
+                  <label for="setting-graph-max-visible-nodes" class="field-label">Max. sichtbare Knoten im Graph</label>
+                  <input type="number" id="setting-graph-max-visible-nodes" class="number-input" min="10" max="20000">
+                </div>
+                <div class="form-group">
+                  <label for="setting-graph-default-hops" class="field-label">Standard-Hops</label>
+                  <input type="number" id="setting-graph-default-hops" class="number-input" min="0" max="3">
+                </div>
+                <div class="form-group">
+                  <label for="setting-graph-max-hops" class="field-label">Max. Hops (1–3)</label>
+                  <input type="number" id="setting-graph-max-hops" class="number-input" min="1" max="3">
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- Server & Datenbank (Neustart erforderlich) -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">Lokaler Server &amp; SQLite-Datenbank</legend>
+              <div class="restart-notice-banner">
+                <span class="notice-icon" aria-hidden="true">⚠️</span>
+                <span>Hinweis: Änderungen an Server und Datenbank werden erst nach einem Neustart der Anwendung wirksam.</span>
+              </div>
+              <div class="form-grid-3">
+                <div class="form-group">
+                  <label for="setting-server-host" class="field-label">Server-Host</label>
+                  <input type="text" id="setting-server-host" class="text-input">
+                </div>
+                <div class="form-group">
+                  <label for="setting-server-port" class="field-label">Server-Port</label>
+                  <input type="number" id="setting-server-port" class="number-input" min="1" max="65535">
+                </div>
+                <div class="form-group">
+                  <label for="setting-db-path" class="field-label">Datenbank-Dateipfad</label>
+                  <input type="text" id="setting-db-path" class="text-input">
+                </div>
+              </div>
+            </fieldset>
+
+            <div class="form-actions">
+              <button type="button" class="btn btn-secondary" id="settings-test-btn-bottom">Verbindung testen</button>
+              <button type="submit" class="btn btn-primary" id="settings-save-btn-bottom">Einstellungen speichern</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "id": "99999",
+  "type": "page",
+  "status": "current",
+  "title": "Cloud Architecture",
+  "spaceId": "1001",
+  "version": {
+    "number": 2,
+    "createdAt": "2026-04-01T12:00:00.000Z"
+  },
+  "body": {
+    "storage": {
+      "value": "<p>Cloud page body</p>"
+    }
+  },
+  "_links": {
+    "webui": "/spaces/CLOUD/pages/99999/Cloud+Architecture"
+  }
+}

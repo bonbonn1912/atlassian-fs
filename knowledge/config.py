@@ -59,13 +59,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "include_remote_links": True,
         "resolve_page_titles": True,
         "refresh_existing": False,
+        "refresh_only": False,
         "request_timeout_seconds": 20,
         "max_retries": 4,
     },
     "index": {"chunk_target_chars": 1200, "chunk_overlap_chars": 150, "min_chunk_chars": 80,
               "max_document_chars": 2_000_000},
     "search": {"max_results": 10, "max_query_chars": 200},
-    "graph": {"max_visible_nodes": 150, "default_hops": 1, "max_hops": 3},
+    "graph": {"max_visible_nodes": 5000, "default_hops": 1, "max_hops": 3},
     "server": {"host": "127.0.0.1", "port": 8765},
     "database": {"path": "data/knowledge.sqlite"},
 }
@@ -74,7 +75,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 # (type, min, max) — type is "int", "float", "bool", "str", "enum:<a|b>", "list"
 
 JOB_FIELD_SPECS: dict[str, tuple] = {
-    "start_page": ("str", 1, 2000),
+    "start_page": ("str", 0, 2000),
     "max_confluence_pages": ("int", 0, 100_000),
     "max_jira_issues": ("int", 0, 100_000),
     "max_total_documents": ("int", 1, 200_000),
@@ -94,6 +95,7 @@ JOB_FIELD_SPECS: dict[str, tuple] = {
     "include_remote_links": ("bool",),
     "resolve_page_titles": ("bool",),
     "refresh_existing": ("bool",),
+    "refresh_only": ("bool",),
     "request_timeout_seconds": ("float", 1, 120),
     "max_retries": ("int", 0, 8),
 }
@@ -129,7 +131,7 @@ SETTINGS_FIELD_SPECS: dict[str, dict[str, tuple]] = {
     },
     "search": {"max_results": ("int", 1, 10), "max_query_chars": ("int", 10, 1000)},
     "graph": {
-        "max_visible_nodes": ("int", 10, 2000),
+        "max_visible_nodes": ("int", 10, 20000),
         "default_hops": ("int", 0, 3),
         "max_hops": ("int", 1, 3),
     },
@@ -251,11 +253,23 @@ def validate_job_params(payload: Any, config: dict) -> tuple[dict, list[str]]:
             errors.append(err)
         else:
             params[name] = checked
-    if not errors and not config["confluence"].get("base_url"):
-        errors.append("Confluence-Basis-URL ist nicht konfiguriert (Einstellungen)")
-    if not errors and params.get("index_linked_jira_issues") and not config["jira"].get("base_url"):
-        errors.append("Jira-Basis-URL ist nicht konfiguriert (Einstellungen), "
-                      "oder 'Jira-Tickets indexieren' deaktivieren")
+
+    if not errors:
+        if params.get("refresh_only"):
+            if not params.get("start_page"):
+                params["start_page"] = "refresh:existing"
+            params["refresh_existing"] = True
+            if not config.get("confluence", {}).get("base_url") and not config.get("jira", {}).get("base_url"):
+                errors.append("Weder Confluence- noch Jira-Basis-URL ist konfiguriert (Einstellungen)")
+        else:
+            if not params.get("start_page"):
+                errors.append("start_page: Pflichtfeld")
+            if not config.get("confluence", {}).get("base_url"):
+                errors.append("Confluence-Basis-URL ist nicht konfiguriert (Einstellungen)")
+            if params.get("index_linked_jira_issues") and not config.get("jira", {}).get("base_url"):
+                errors.append("Jira-Basis-URL ist nicht konfiguriert (Einstellungen), "
+                              "oder 'Jira-Tickets indexieren' deaktivieren")
+
     return params, errors
 
 

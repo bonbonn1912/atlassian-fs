@@ -170,6 +170,11 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+# All tools only read the local SQLite index. Declaring this lets MCP gateways cache their results safely.
+READ_ONLY_ANNOTATIONS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+for _tool in TOOL_DEFINITIONS:
+    _tool.setdefault("annotations", dict(READ_ONLY_ANNOTATIONS))
+
 TOOL_MAP = {t["name"]: t for t in TOOL_DEFINITIONS}
 
 

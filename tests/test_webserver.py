@@ -291,6 +291,45 @@ class TestWebServer(unittest.TestCase):
         self.assertEqual(err["error"]["code"], "job_conflict")
         self.assertIn("Während einer laufenden Indexierung", err["error"]["message"])
 
+    def test_api_settings_selected_spaces_roundtrip(self) -> None:
+        """Spaces chosen in the UI are stored verbatim (case-sensitive keys)."""
+        patch = {"confluence": {"selected_spaces": ["ENG", "~jsmith"]}}
+        status, _, body = self.make_request("PUT", "/api/settings", data=patch)
+        self.assertEqual(status, 200)
+        updated = json.loads(body.decode("utf-8"))
+        self.assertEqual(updated["confluence"]["selected_spaces"], ["ENG", "~jsmith"])
+
+        status, _, body = self.make_request("GET", "/api/settings")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body.decode("utf-8"))["confluence"]["selected_spaces"],
+            ["ENG", "~jsmith"],
+        )
+
+        self.make_request("PUT", "/api/settings", data={"confluence": {"selected_spaces": []}})
+
+    def test_api_settings_rejects_invalid_job_defaults(self) -> None:
+        """Values the job validation would reject must not be stored as defaults."""
+        status, _, body = self.make_request(
+            "PUT", "/api/settings", data={"crawl_defaults": {"modified_since": "irgendwann"}})
+        self.assertEqual(status, 400)
+
+        status, _, body = self.make_request(
+            "PUT", "/api/settings", data={"crawl_defaults": {"space_keys": ["A B"]}})
+        self.assertEqual(status, 400)
+
+        status, _, body = self.make_request(
+            "PUT", "/api/settings", data={"confluence": {"selected_spaces": ["bad key"]}})
+        self.assertEqual(status, 400)
+
+        # Relative dates are accepted and normalized
+        status, _, body = self.make_request(
+            "PUT", "/api/settings", data={"crawl_defaults": {"modified_since": "7d"}})
+        self.assertEqual(status, 200)
+        updated = json.loads(body.decode("utf-8"))
+        self.assertRegex(updated["crawl_defaults"]["modified_since"], r"^\d{4}-\d{2}-\d{2}$")
+        self.make_request("PUT", "/api/settings", data={"crawl_defaults": {"modified_since": ""}})
+
     # 4. /api/settings/test
     def test_api_settings_test_unconfigured(self) -> None:
         status, _, body = self.make_request("POST", "/api/settings/test")
@@ -300,6 +339,93 @@ class TestWebServer(unittest.TestCase):
         self.assertIn("jira", res)
         self.assertFalse(res["confluence"]["ok"])
         self.assertIn("Nicht konfiguriert", res["confluence"]["message"])
+
+    # 4b. /api/spaces
+    def test_api_spaces_unconfigured(self) -> None:
+        status, _, body = self.make_request("GET", "/api/spaces")
+        self.assertEqual(status, 400)
+        err = json.loads(body.decode("utf-8"))
+        self.assertEqual(err["error"]["code"], "bad_request")
+        self.assertIn("Confluence-Basis-URL", err["error"]["message"])
+
+    def test_api_spaces_listing_cache_and_errors(self) -> None:
+        class FakeSpacesClient:
+            def __init__(self, calls: list) -> None:
+                self.calls = calls
+
+            def list_spaces(self, max_items: int = 2000) -> list[dict]:
+                self.calls.append(max_items)
+                return [{
+                    "key": "ENG", "name": "Engineering", "type": "global", "id": "1",
+                    "url": "https://confluence.example.intern/display/ENG",
+                }]
+
+        self.config_store.update({"confluence": {"base_url": "https://confluence.example.intern"}})
+        calls: list[int] = []
+        self.server.confluence_factory = lambda cfg: FakeSpacesClient(calls)
+        try:
+            status, _, body = self.make_request("GET", "/api/spaces")
+            self.assertEqual(status, 200)
+            data = json.loads(body.decode("utf-8"))
+            self.assertEqual([s["key"] for s in data["spaces"]], ["ENG"])
+            self.assertFalse(data["cached"])
+            self.assertEqual(len(calls), 1)
+
+            # Second request is served from the in-memory cache
+            status, _, body = self.make_request("GET", "/api/spaces")
+            data = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertTrue(data["cached"])
+            self.assertEqual(len(calls), 1)
+
+            # ?refresh=1 forces a new upstream fetch
+            status, _, body = self.make_request("GET", "/api/spaces?refresh=1")
+            data = json.loads(body.decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertFalse(data["cached"])
+            self.assertEqual(len(calls), 2)
+
+            # Changing the Confluence connection settings invalidates the cache
+            status, _, body = self.make_request(
+                "PUT", "/api/settings",
+                data={"confluence": {"base_url": "https://confluence-mirror.example.intern"}})
+            self.assertEqual(status, 200)
+            status, _, body = self.make_request("GET", "/api/spaces")
+            data = json.loads(body.decode("utf-8"))
+            self.assertFalse(data["cached"])
+            self.assertEqual(len(calls), 3)
+
+            # Only selecting spaces (crawl defaults) keeps the cache valid
+            status, _, body = self.make_request(
+                "PUT", "/api/settings", data={"confluence": {"selected_spaces": ["ENG"]}})
+            self.assertEqual(status, 200)
+            status, _, body = self.make_request("GET", "/api/spaces")
+            data = json.loads(body.decode("utf-8"))
+            self.assertTrue(data["cached"])
+            self.assertEqual(len(calls), 3)
+
+            # Upstream failure with cached data -> stale cache instead of an error
+            def failing_factory(cfg):
+                raise RuntimeError("Upstream nicht erreichbar")
+
+            self.server.confluence_factory = failing_factory
+            status, _, body = self.make_request("GET", "/api/spaces?refresh=1")
+            self.assertEqual(status, 200)
+            data = json.loads(body.decode("utf-8"))
+            self.assertTrue(data["stale"])
+            self.assertIn("Upstream nicht erreichbar", data["warning"])
+            self.assertEqual([s["key"] for s in data["spaces"]], ["ENG"])
+
+            # Upstream failure without cache -> 502
+            self.server.spaces_cache = None
+            status, _, body = self.make_request("GET", "/api/spaces")
+            self.assertEqual(status, 502)
+            err = json.loads(body.decode("utf-8"))
+            self.assertEqual(err["error"]["code"], "upstream_error")
+        finally:
+            self.server.confluence_factory = None
+            self.server.spaces_cache = None
+            self.config_store.update({"confluence": {"base_url": "", "selected_spaces": []}})
 
     # 5. /api/jobs POST, GET current, GET {id}, POST {id}/stop
     def test_api_jobs_lifecycle(self) -> None:
@@ -501,6 +627,28 @@ class TestWebServer(unittest.TestCase):
         self.assertEqual(status, 404)
         err = json.loads(body.decode("utf-8"))
         self.assertEqual(err["error"]["code"], "not_found")
+
+    # 15. /api/top-documents
+    def test_api_top_documents(self) -> None:
+        status, _, body = self.make_request("GET", "/api/top-documents?limit=10")
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        self.assertIn("documents", res)
+        self.assertIn("total", res)
+        self.assertIn("limit", res)
+        self.assertEqual(res["limit"], 10)
+
+        # Invalid type -> 400
+        status, _, body = self.make_request("GET", "/api/top-documents?types=unknown")
+        self.assertEqual(status, 400)
+        err = json.loads(body.decode("utf-8"))
+        self.assertEqual(err["error"]["code"], "bad_request")
+
+        # Invalid limit -> 400
+        status, _, body = self.make_request("GET", "/api/top-documents?limit=xyz")
+        self.assertEqual(status, 400)
+        err = json.loads(body.decode("utf-8"))
+        self.assertEqual(err["error"]["code"], "bad_request")
 
 
 if __name__ == "__main__":

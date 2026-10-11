@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "api_mode": "server",
         "sleep_seconds": 1.0,
         "aliases": [],             # further base URLs that point to the same instance
+        "selected_spaces": [],     # space keys chosen in the settings UI
         "auth": {"type": "none", "username": "", "token": ""},
     },
     "jira": {
@@ -42,6 +45,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "crawl_defaults": {
         "start_page": "",
+        "space_key": "",
+        "space_keys": [],
+        "modified_since": "",
+        "batch_fetch_size": 100,
         "max_confluence_pages": 100,
         "max_jira_issues": 100,
         "max_total_documents": 200,
@@ -76,6 +83,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 JOB_FIELD_SPECS: dict[str, tuple] = {
     "start_page": ("str", 0, 2000),
+    "space_key": ("str", 0, 100),
+    "space_keys": ("spacekeylist",),
+    "modified_since": ("str", 0, 40),
+    "batch_fetch_size": ("int", 1, 100),
     "max_confluence_pages": ("int", 0, 100_000),
     "max_jira_issues": ("int", 0, 100_000),
     "max_total_documents": ("int", 1, 200_000),
@@ -106,6 +117,7 @@ SETTINGS_FIELD_SPECS: dict[str, dict[str, tuple]] = {
         "api_mode": ("enum", CONFLUENCE_API_MODES),
         "sleep_seconds": ("float", 0, 120),
         "aliases": ("urllist",),
+        "selected_spaces": ("spacekeylist",),
     },
     "jira": {
         "base_url": ("url",),
@@ -138,8 +150,9 @@ SETTINGS_FIELD_SPECS: dict[str, dict[str, tuple]] = {
     "server": {"host": ("str", 1, 255), "port": ("int", 1, 65535)},
     "database": {"path": ("str", 1, 1000)},
 }
-# start_page may be empty in the defaults.
+# start_page and space_key may be empty in the defaults.
 SETTINGS_FIELD_SPECS["crawl_defaults"]["start_page"] = ("str", 0, 2000)
+SETTINGS_FIELD_SPECS["crawl_defaults"]["space_key"] = ("str", 0, 100)
 
 AUTH_FIELDS = ("type", "username", "token")
 
@@ -152,6 +165,14 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[key] = copy.deepcopy(value)
     return out
+
+
+_SPACE_KEY_RE = re.compile(r"^[A-Z0-9_~-]+$")
+# Space keys from the Confluence API keep their case: personal spaces use keys
+# like "~jsmith"; the pattern only blocks characters that would break CQL.
+_SPACE_KEY_LIST_RE = re.compile(r"^[A-Za-z0-9_.~:@-]+$")
+_MODIFIED_SINCE_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_RELATIVE_SINCE_RE = re.compile(r"^(\d{1,4})([dw])$", re.IGNORECASE)
 
 
 def _check_value(spec: tuple, value: Any, name: str) -> tuple[Any, str | None]:
@@ -223,10 +244,59 @@ def _check_value(spec: tuple, value: Any, name: str) -> tuple[Any, str | None]:
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             return None, f"{name}: Liste erwartet"
         return [v.strip().upper() for v in value if v.strip()], None
+    if kind == "spacekeylist":
+        # Like keylist but preserves case and validates the key format –
+        # Confluence personal space keys ("~jsmith") are case-sensitive.
+        if isinstance(value, str):
+            value = [v for v in (p.strip() for p in value.replace("\n", ",").split(",")) if v]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return None, f"{name}: Liste erwartet"
+        out = []
+        for item in value:
+            item = item.strip()
+            if not item:
+                continue
+            if not _SPACE_KEY_LIST_RE.match(item):
+                return None, f"{name}: Ungültiger Space-Key {item!r}"
+            if item not in out:
+                out.append(item)
+        return out, None
     raise AssertionError(kind)
 
 
 # ----------------------------------------------------------------- job params
+
+def _normalize_modified_since(value: Any, name: str = "modified_since") -> tuple[str, str | None]:
+    """Normalize an ISO date/timestamp or a relative offset (7d, 2w) to YYYY-MM-DD."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "", None
+
+    relative = _RELATIVE_SINCE_RE.fullmatch(raw)
+    if relative:
+        amount = int(relative.group(1))
+        days = amount * (7 if relative.group(2).lower() == "w" else 1)
+        if amount < 1 or days > 3650:
+            return "", f"{name}: Zeitraum muss zwischen 1 Tag und 10 Jahren liegen"
+        stamp = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+        return stamp, None
+
+    date_only = _MODIFIED_SINCE_DATE_RE.fullmatch(raw)
+    if date_only:
+        try:
+            parsed = datetime(int(date_only.group(1)), int(date_only.group(2)),
+                              int(date_only.group(3)))
+        except ValueError as exc:
+            return "", f"{name}: ungültiges Datum ({exc})"
+        return parsed.date().isoformat(), None
+
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return "", (f"{name}: Datum als JJJJ-MM-TT, ISO-Zeitstempel oder relativ "
+                    "(z. B. 7d, 2w) erwartet")
+    return parsed.date().isoformat(), None
+
 
 def validate_job_params(payload: Any, config: dict) -> tuple[dict, list[str]]:
     """Merge a job start request with config defaults and validate it.
@@ -255,6 +325,18 @@ def validate_job_params(payload: Any, config: dict) -> tuple[dict, list[str]]:
             params[name] = checked
 
     if not errors:
+        since, since_err = _normalize_modified_since(params.get("modified_since", ""))
+        if since_err:
+            errors.append(since_err)
+        params["modified_since"] = since
+
+        if params.get("space_key"):
+            raw_sk = str(params["space_key"]).strip().upper()
+            if not _SPACE_KEY_RE.match(raw_sk):
+                errors.append("space_key: Ungültiges Format für Space-Key")
+            else:
+                params["space_key"] = raw_sk
+
         if params.get("refresh_only"):
             if not params.get("start_page"):
                 params["start_page"] = "refresh:existing"
@@ -262,8 +344,20 @@ def validate_job_params(payload: Any, config: dict) -> tuple[dict, list[str]]:
             if not config.get("confluence", {}).get("base_url") and not config.get("jira", {}).get("base_url"):
                 errors.append("Weder Confluence- noch Jira-Basis-URL ist konfiguriert (Einstellungen)")
         else:
-            if not params.get("start_page"):
-                errors.append("start_page: Pflichtfeld")
+            if params.get("modified_since") and not params.get("space_keys") and params.get("space_key"):
+                # A single space key filters the update run to that space.
+                params["space_keys"] = [params["space_key"]]
+            if params.get("modified_since"):
+                params["start_page"] = f"recent:{params['modified_since']}"
+            elif params.get("space_keys"):
+                params["start_page"] = "space:" + ",".join(params["space_keys"])
+            elif params.get("space_key") and not params.get("start_page"):
+                params["start_page"] = f"space:{params['space_key']}"
+            elif not params.get("start_page"):
+                errors.append(
+                    "start_page: Pflichtfeld (oder Space-Key, Space-Auswahl bzw. "
+                    "Änderungsdatum angeben)"
+                )
             if not config.get("confluence", {}).get("base_url"):
                 errors.append("Confluence-Basis-URL ist nicht konfiguriert (Einstellungen)")
             if params.get("index_linked_jira_issues") and not config.get("jira", {}).get("base_url"):
@@ -310,8 +404,13 @@ def validate_settings_patch(patch: Any) -> tuple[dict, list[str]]:
             checked, err = _check_value(specs[key], value, name)
             if err:
                 errors.append(err)
-            else:
-                out[key] = checked
+                continue
+            if section == "crawl_defaults" and key == "modified_since":
+                checked, err = _normalize_modified_since(checked, name)
+                if err:
+                    errors.append(err)
+                    continue
+            out[key] = checked
         clean[section] = out
     return clean, errors
 
@@ -319,125 +418,123 @@ def validate_settings_patch(patch: Any) -> tuple[dict, list[str]]:
 def _check_auth(value: Any, name: str) -> tuple[dict | None, str | None]:
     if not isinstance(value, dict):
         return None, f"{name}: Objekt erwartet"
-    out: dict[str, Any] = {}
-    for key, val in value.items():
-        if key == "type":
-            if val not in AUTH_TYPES:
-                return None, f"{name}.type: erlaubt sind {', '.join(AUTH_TYPES)}"
-            out["type"] = val
-        elif key in ("username", "token"):
-            if not isinstance(val, str) or len(val) > 4000:
-                return None, f"{name}.{key}: Text erwartet"
-            out[key] = val.strip()
-        elif key == "clear_token":
-            if not isinstance(val, bool):
-                return None, f"{name}.clear_token: Wahrheitswert erwartet"
-            out["clear_token"] = val
-        else:
-            return None, f"Unbekanntes Feld: {name}.{key}"
-    return out, None
+    auth_type = value.get("type")
+    if auth_type not in AUTH_TYPES:
+        return None, f"{name}.type: erlaubt sind {', '.join(AUTH_TYPES)}"
+    username = value.get("username", "")
+    if not isinstance(username, str):
+        return None, f"{name}.username: Text erwartet"
+    token = value.get("token", "")
+    if not isinstance(token, str):
+        return None, f"{name}.token: Text erwartet"
+    clear = bool(value.get("clear_token"))
+    return {"type": auth_type, "username": username.strip(), "token": token.strip(),
+            "clear_token": clear}, None
 
+
+# ----------------------------------------------------------------- store
 
 class ConfigStore:
-    """Thread-safe holder for the current configuration backed by a JSON file."""
+    """Thread-safe configuration holder with read/write persistence."""
 
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path else DEFAULT_CONFIG_PATH
+        # Reentrant: update() re-reads the config while holding the lock.
         self._lock = threading.RLock()
-        self._config = load_config(self.path)
+        self._cfg = self._load()
 
     def get(self) -> dict:
-        """Deep copy of the effective config (incl. env overrides and secrets)."""
         with self._lock:
-            return apply_env_overrides(copy.deepcopy(self._config))
+            return apply_env_overrides(copy.deepcopy(self._cfg))
 
     def get_public(self) -> dict:
-        """Config safe to send to the browser: tokens replaced by token_set flags."""
-        return redact(self.get())
+        """Config without plaintext secrets; includes token_set bools."""
+        cfg = self.get()
+        for s in ("confluence", "jira"):
+            auth = cfg.get(s, {}).get("auth") or {}
+            cfg[s]["auth"] = {
+                "type": auth.get("type", "none"),
+                "username": auth.get("username", ""),
+                "token": "",
+                "token_set": bool(auth.get("token")),
+            }
+        return cfg
 
     def update(self, patch: dict) -> dict:
-        """Validate and persist a partial update. Raises ConfigError."""
+        """Validate and apply a partial settings update, then write to disk."""
         clean, errors = validate_settings_patch(patch)
         if errors:
             raise ConfigError("; ".join(errors))
         with self._lock:
-            new = copy.deepcopy(self._config)
-            for section, values in clean.items():
-                for key, value in values.items():
-                    if key == "auth":
-                        auth = new[section].setdefault("auth", {})
-                        if value.get("clear_token"):
-                            auth["token"] = ""
-                        if "type" in value:
-                            auth["type"] = value["type"]
-                        if "username" in value:
-                            auth["username"] = value["username"]
-                        if value.get("token"):
-                            auth["token"] = value["token"]
-                    else:
-                        new[section][key] = value
-            graph = new["graph"]
-            if graph["default_hops"] > graph["max_hops"]:
+            # Preserve existing tokens if the patch did not clear or change them
+            for s in ("confluence", "jira"):
+                if s in clean and "auth" in clean[s]:
+                    incoming = clean[s]["auth"]
+                    old = self._cfg.get(s, {}).get("auth") or {}
+                    if incoming.get("clear_token"):
+                        incoming["token"] = ""
+                    elif not incoming.get("token"):
+                        incoming["token"] = old.get("token", "")
+                    incoming.pop("clear_token", None)
+
+            merged = _deep_merge(self._cfg, clean)
+            graph = merged.get("graph") or {}
+            if int(graph.get("default_hops", 1)) > int(graph.get("max_hops", 3)):
                 raise ConfigError("graph.default_hops darf nicht größer als graph.max_hops sein")
-            save_config(self.path, new)
-            self._config = new
-            return redact(apply_env_overrides(copy.deepcopy(new)))
+            self._cfg = merged
+            save_config(self._cfg, self.path)
+            return self.get_public()
+
+    def _load(self) -> dict:
+        if not self.path.exists():
+            return copy.deepcopy(DEFAULT_CONFIG)
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            raise ConfigError(f"Konfigurationsdatei {self.path} ist defekt: {exc}") from exc
+        return _deep_merge(DEFAULT_CONFIG, data if isinstance(data, dict) else {})
 
 
 def load_config(path: str | Path | None = None) -> dict:
-    """Load config.json (if present) merged over DEFAULT_CONFIG."""
-    path = Path(path) if path else DEFAULT_CONFIG_PATH
-    data: dict = {}
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ConfigError(f"config.json konnte nicht gelesen werden: {exc}") from exc
-        if not isinstance(data, dict):
-            raise ConfigError("config.json muss ein JSON-Objekt sein")
-    cfg = _deep_merge(DEFAULT_CONFIG, data)
-    for section in ("confluence", "jira"):
-        cfg[section]["base_url"] = (cfg[section].get("base_url") or "").strip().rstrip("/")
-    return cfg
+    return ConfigStore(path).get()
 
 
-def save_config(path: str | Path, config: dict) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+def save_config(cfg: dict | str | Path, path: str | Path | None = None) -> None:
+    if isinstance(cfg, (str, Path)) and isinstance(path, dict):
+        cfg, path = path, cfg
+    p = Path(path) if path else DEFAULT_CONFIG_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
     try:
         os.chmod(tmp, 0o600)  # may contain tokens
     except OSError:
         pass
-    os.replace(tmp, path)
+    tmp.replace(p)
 
 
 def apply_env_overrides(cfg: dict) -> dict:
     """CONFLUENCE_TOKEN / JIRA_TOKEN (+ _USERNAME, _AUTH_TYPE) override the file."""
     for section in ("confluence", "jira"):
         prefix = section.upper()
-        auth = cfg[section].setdefault("auth", {"type": "none", "username": "", "token": ""})
+        auth = cfg.setdefault(section, {}).setdefault(
+            "auth", {"type": "none", "username": "", "token": ""})
         token = os.environ.get(f"{prefix}_TOKEN")
         if token:
             auth["token"] = token
             auth["type"] = os.environ.get(f"{prefix}_AUTH_TYPE") or (
                 auth.get("type") if auth.get("type") != "none" else "bearer")
-        user = os.environ.get(f"{prefix}_USERNAME")
-        if user:
-            auth["username"] = user
+        username = os.environ.get(f"{prefix}_USERNAME")
+        if username:
+            auth["username"] = username
     return cfg
 
 
-def redact(cfg: dict) -> dict:
-    out = copy.deepcopy(cfg)
-    for section in ("confluence", "jira"):
-        auth = out[section].get("auth", {})
-        auth["token_set"] = bool(auth.get("token"))
-        auth["token"] = ""
-    return out
-
-
 def resolve_db_path(cfg: dict) -> Path:
-    p = Path(cfg["database"]["path"])
-    return p if p.is_absolute() else PROJECT_ROOT / p
+    p = Path(cfg.get("database", {}).get("path") or "data/knowledge.sqlite")
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return p

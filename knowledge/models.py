@@ -75,6 +75,15 @@ def parse_uid(uid: str) -> tuple[str, str]:
     return source_type, source_id
 
 
+def is_document_uid(uid: str) -> bool:
+    """True for uids of fetchable documents (Confluence/Jira).
+
+    Pseudo uids such as `space:ENG` (a space root URL used as start page) are
+    not documents and must never become graph nodes.
+    """
+    return isinstance(uid, str) and uid.startswith(("confluence:", "jira:"))
+
+
 def is_unresolved_uid(uid: str) -> bool:
     return uid.startswith("confluence:" + UNRESOLVED_PREFIX)
 

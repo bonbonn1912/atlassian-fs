@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 import urllib.parse
 
 from .atlassian_http import RateLimitedClient
-from .links import LinkContext, classify_url, jira_issue_url, normalize_issue_key
+from .links import LinkContext, classify_document_url, jira_issue_url, normalize_issue_key
 from .models import (
-    EDGE_JIRA_PARENT_OF, EDGE_JIRA_RELATES_TO, AtlassianError, FetchedDocument,
-    InvalidResponseError, LinkTarget, edge_kind_for, jira_uid, parse_uid,
+    EDGE_JIRA_PARENT_OF, EDGE_JIRA_RELATES_TO, AtlassianError, BudgetExceeded,
+    CrawlStopped, FetchedDocument, InvalidResponseError, LinkTarget, NotFoundError,
+    edge_kind_for, jira_uid, parse_uid,
 )
 from .text import adf_to_content, jira_wiki_to_content, truncate_text
 
@@ -17,6 +19,8 @@ logger = logging.getLogger(__name__)
 API_MODES = ("server_v2", "cloud_v3")
 JIRA_FIELDS = ("summary,description,status,issuetype,project,labels,components,"
                "created,updated,issuelinks,parent,subtasks")
+# Atlassian search endpoints return at most 100 issues per request.
+BULK_ISSUE_SIZE = 100
 
 
 class JiraClient:
@@ -38,13 +42,9 @@ class JiraClient:
                           anchor_text=key, evidence_url=jira_issue_url(self.ctx, key),
                           title_hint=f"{key}: {title}" if title else "")
 
-    def fetch_document(self, issue_key: str, *, include_remote_links: bool,
-                       scan_plain_keys: bool = False) -> FetchedDocument:
-        requested = normalize_issue_key(issue_key)
-        if not requested:
-            raise ValueError(f"Ungültiger Jira-Key: {issue_key!r}")
-        data = self.http.get_json(f"{self._api}/issue/{urllib.parse.quote(requested)}",
-                                  {"fields": JIRA_FIELDS})
+    def _document_from_issue(self, data: dict, requested: str, *,
+                             scan_plain_keys: bool) -> FetchedDocument:
+        """Build a FetchedDocument from an issue payload (issue endpoint or JQL search)."""
         if not isinstance(data, dict) or not isinstance(data.get("fields"), dict):
             raise InvalidResponseError(f"Jira-Issue {requested}: Antwort ohne 'fields'")
         key = normalize_issue_key(str(data.get("key") or "")) or requested
@@ -117,8 +117,6 @@ class JiraClient:
                                         field="issuelinks",
                                         title=str((other.get("fields") or {}).get("summary") or "")))
         links.extend(parsed.links)
-        if include_remote_links:
-            links.extend(self._remote_links(key))
 
         return FetchedDocument(
             uid=jira_uid(key), source_type="jira", source_id=key,
@@ -127,6 +125,147 @@ class JiraClient:
             links=_dedupe(links), space_or_project=project, status_label=status,
             document_type=issue_type, source_version=None,
             source_updated_at=fields.get("updated"), labels=labels)
+
+    def fetch_document(self, issue_key: str, *, include_remote_links: bool,
+                       scan_plain_keys: bool = False) -> FetchedDocument:
+        requested = normalize_issue_key(issue_key)
+        if not requested:
+            raise ValueError(f"Ungültiger Jira-Key: {issue_key!r}")
+        data = self.http.get_json(f"{self._api}/issue/{urllib.parse.quote(requested)}",
+                                  {"fields": JIRA_FIELDS})
+        doc = self._document_from_issue(data, requested, scan_plain_keys=scan_plain_keys)
+        if include_remote_links:
+            doc.links = _dedupe(doc.links + self._remote_links(doc.source_id))
+        return doc
+
+    def fetch_documents_bulk(
+        self,
+        issue_keys: list[str],
+        *,
+        include_remote_links: bool = True,
+        scan_plain_keys: bool = False,
+        chunk_size: int = BULK_ISSUE_SIZE,
+    ) -> dict[str, FetchedDocument | Exception]:
+        """Fetch up to `chunk_size` issues (max. 100) with one JQL search request.
+
+        Returns {issue_key: FetchedDocument | Exception}; keys the search does
+        not return (deleted, no permission) map to NotFoundError.
+        """
+        out: dict[str, FetchedDocument | Exception] = {}
+        keys: list[str] = []
+        for raw in issue_keys:
+            key = normalize_issue_key(raw)
+            if not key:
+                out[str(raw)] = ValueError(f"Ungültiger Jira-Key: {raw!r}")
+                continue
+            if key not in keys:
+                keys.append(key)
+
+        step = max(1, min(int(chunk_size), BULK_ISSUE_SIZE))
+        for start in range(0, len(keys), step):
+            chunk = keys[start:start + step]
+            try:
+                payloads = self._bulk_issue_payloads(chunk)
+            except (CrawlStopped, BudgetExceeded):
+                raise
+            except Exception as exc:
+                # Search endpoint unavailable: fall back to single issue GETs.
+                logger.info(
+                    "Bulk-Ticketabruf fehlgeschlagen (%s) – Einzelabruf für %d Ticket(s)",
+                    exc, len(chunk),
+                )
+                for key in chunk:
+                    try:
+                        out[key] = self.fetch_document(
+                            key, include_remote_links=False, scan_plain_keys=scan_plain_keys)
+                    except Exception as single_exc:
+                        out[key] = single_exc
+                continue
+            for key in chunk:
+                item = payloads.get(key)
+                if item is None:
+                    # JQL never matches moved/deleted keys: resolve them with a
+                    # single request so "moved" redirects and 403s stay visible.
+                    try:
+                        out[key] = self.fetch_document(
+                            key, include_remote_links=False, scan_plain_keys=scan_plain_keys)
+                    except Exception as exc:
+                        out[key] = exc
+                    continue
+                try:
+                    out[key] = self._document_from_issue(item, key, scan_plain_keys=scan_plain_keys)
+                except Exception as exc:
+                    out[key] = exc
+
+        if include_remote_links:
+            for key, item in out.items():
+                if isinstance(item, Exception):
+                    continue
+                try:
+                    item.links = _dedupe(item.links + self._remote_links(key))
+                except CrawlStopped:
+                    raise
+                except BudgetExceeded as exc:
+                    # Remote links are an enrichment: keep the fetched issues.
+                    logger.warning(
+                        "Remote-Links nicht vollständig abrufbar (%s) – Issues ohne Remote-Kanten", exc
+                    )
+                    break
+        return out
+
+    def _bulk_issue_payloads(self, issue_keys: list[str]) -> dict[str, dict]:
+        """Raw issue payloads for up to 100 keys via JQL search, keyed by issue key."""
+        jql = "key in (" + ", ".join(issue_keys) + ")"
+        found: dict[str, dict] = {}
+        endpoint = f"{self._api}/search/jql" if self.api_mode == "cloud_v3" else f"{self._api}/search"
+        next_token: str | None = None
+        start_at = 0
+
+        for _ in range(5):  # bounded pagination
+            if len(found) >= len(issue_keys):
+                break
+            params: dict[str, Any] = {
+                "jql": jql, "fields": JIRA_FIELDS, "maxResults": len(issue_keys),
+            }
+            if endpoint.endswith("/jql"):
+                if next_token:
+                    params["nextPageToken"] = next_token
+            else:
+                params["validateQuery"] = "false"
+                if start_at:
+                    params["startAt"] = start_at
+            try:
+                data = self.http.get_json(endpoint, params)
+            except AtlassianError as exc:
+                if endpoint.endswith("/jql") and exc.status in (400, 404, 405, 410, 501):
+                    logger.info(
+                        "Jira-Suchendpunkt %s nicht verfügbar (%s) – wechsle zu %s/search",
+                        endpoint, exc.status, self._api,
+                    )
+                    endpoint = f"{self._api}/search"
+                    next_token = None
+                    start_at = 0
+                    continue
+                raise
+            if not isinstance(data, dict):
+                raise InvalidResponseError("Bulk-Ticketabruf: unerwartete Antwort")
+            issues = data.get("issues") or []
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                key = normalize_issue_key(str(issue.get("key") or ""))
+                if key:
+                    found[key] = issue
+            if endpoint.endswith("/jql"):
+                next_token = data.get("nextPageToken") or None
+                if not next_token or not issues:
+                    break
+            else:
+                if (not issues or len(issues) < int(params["maxResults"])
+                        or len(found) >= len(issue_keys)):
+                    break
+                start_at += len(issues)
+        return found
 
     def _remote_links(self, key: str) -> list[LinkTarget]:
         """Remote links pointing to known Confluence/Jira objects. Failures are non-fatal."""
@@ -141,7 +280,7 @@ class JiraClient:
             url = obj.get("url")
             if not isinstance(url, str):
                 continue
-            classified = classify_url(url, self.ctx)
+            classified = classify_document_url(url, self.ctx)
             if not classified:
                 continue
             uid, evidence = classified

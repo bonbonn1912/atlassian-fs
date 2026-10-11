@@ -92,7 +92,22 @@ CREATE TABLE IF NOT EXISTS crawl_log (
 CREATE INDEX IF NOT EXISTS idx_crawl_log_job ON crawl_log(job_id, id);
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1)]
+# Title resolutions of "/display/SPACE/Title" links. Cached so a crawl does not
+# resolve the same (space, title) pair again on every run.
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS title_resolutions (
+  space_key TEXT NOT NULL,
+  title TEXT NOT NULL,
+  page_id TEXT,                -- NULL = looked up, but not resolvable
+  resolved_at TEXT NOT NULL,
+  PRIMARY KEY (space_key, title)
+);
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2)]
+
+# Negative results are re-checked after this many seconds (page may be created later).
+TITLE_RESOLUTION_MISS_TTL_SECONDS = 7 * 24 * 60 * 60
 
 JOB_COLUMNS = ("state", "start_page_uid", "finished_at", "pages_indexed", "jira_indexed",
                "api_requests", "skipped", "errors", "current_uid", "last_message")
@@ -312,6 +327,46 @@ def get_existing_document_uids(conn: sqlite3.Connection) -> list[str]:
         (STATE_INDEXED, STATE_ERROR),
     ).fetchall()
     return [r[0] for r in rows]
+
+
+# ----------------------------------------------------------------- title resolutions
+
+def get_title_resolution(conn: sqlite3.Connection, space_key: str, title: str) -> tuple[bool, str | None]:
+    """Cached lookup of a (space, title) pair.
+
+    Returns (known, page_id): `known=False` means "not cached, ask the API";
+    `page_id=None` with `known=True` means "known to be unresolvable" (still
+    within the miss TTL).
+    """
+    row = conn.execute(
+        "SELECT page_id, resolved_at FROM title_resolutions WHERE space_key=? AND title=?",
+        ((space_key or "").strip().upper(), title),
+    ).fetchone()
+    if row is None:
+        return False, None
+    page_id = row["page_id"]
+    if page_id:
+        return True, str(page_id)
+    stamp = row["resolved_at"]
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds()
+    except (TypeError, ValueError):
+        age = TITLE_RESOLUTION_MISS_TTL_SECONDS + 1
+    if age <= TITLE_RESOLUTION_MISS_TTL_SECONDS:
+        return True, None
+    return False, None   # stale miss -> resolve again
+
+
+def save_title_resolution(conn: sqlite3.Connection, space_key: str, title: str,
+                          page_id: str | None) -> None:
+    """Store a title resolution (page_id None = not resolvable)."""
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO title_resolutions(space_key, title, page_id, resolved_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(space_key, title) DO UPDATE SET "
+            "page_id=excluded.page_id, resolved_at=excluded.resolved_at",
+            ((space_key or "").strip().upper(), title, page_id or None, now_iso()),
+        )
 
 
 # ----------------------------------------------------------------- jobs

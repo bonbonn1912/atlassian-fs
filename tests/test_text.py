@@ -176,6 +176,45 @@ class TestText(unittest.TestCase):
         self.assertNotIn("color: red", parsed.plain_text)
         self.assertIn("Real readable content.", parsed.plain_text)
 
+    def test_confluence_storage_space_root_link_is_skipped_without_truncating(self) -> None:
+        """Space root URLs are not documents: no link, but parsing continues."""
+        storage = (
+            "<p>Siehe <a href=\"https://confluence.intern/display/ENG\">Space ENG</a>.</p>"
+            "<h2>Abschnitt 2</h2><p>Weiterer Inhalt.</p>"
+        )
+        parsed = parse_confluence_storage(storage, self.ctx)
+        self.assertEqual(parsed.links, [])
+        self.assertIn("Space ENG", parsed.plain_text)
+        # Der Rest des Dokuments darf nicht abgeschnitten werden
+        self.assertIn("Abschnitt 2", [h for h, _ in parsed.sections])
+        self.assertIn("Weiterer Inhalt.", parsed.plain_text)
+
+    def test_adf_space_root_link_is_skipped(self) -> None:
+        doc = {
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text", "text": "Space ENG",
+                    "marks": [{"type": "link",
+                               "attrs": {"href": "https://confluence.intern/spaces/ENG"}}],
+                }],
+            }],
+        }
+        parsed = adf_to_content(doc, self.ctx, source_type="jira")
+        self.assertEqual(parsed.links, [])
+        self.assertIn("Space ENG", parsed.plain_text)
+
+    def test_jira_wiki_space_root_link_is_skipped(self) -> None:
+        parsed = jira_wiki_to_content(
+            "Siehe [Space ENG|https://confluence.intern/display/ENG] und "
+            "[PROJ-1|https://jira.intern/browse/PROJ-1].",
+            self.ctx,
+        )
+        uids = [lk.uid for lk in parsed.links]
+        self.assertNotIn("space:ENG", uids)
+        self.assertIn("jira:PROJ-1", uids)
+
     # --- ADF Tests ---
 
     def test_adf_fixture(self) -> None:

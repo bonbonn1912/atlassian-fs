@@ -9,6 +9,7 @@ import re
 import socket
 import sqlite3
 import threading
+import time
 from typing import Any
 import urllib.parse
 
@@ -19,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 # Max request body: 1 MB
 MAX_BODY_SIZE = 1024 * 1024
+
+# Space listing cache: reuse results for 10 minutes unless ?refresh=1 is given.
+SPACES_CACHE_TTL_SECONDS = 600.0
+SPACES_MAX_REQUESTS = 400
+SPACES_BUDGET_SECONDS = 300.0
 
 # Static file mapping
 STATIC_FILES: dict[str, str] = {
@@ -80,11 +86,17 @@ class KnowledgeServer(http.server.ThreadingHTTPServer):
         job_manager: Any,
         web_dir: Path,
         db_path: Path,
+        confluence_factory: Any | None = None,
     ) -> None:
         self.config_store = config_store
         self.job_manager = job_manager
         self.web_dir = web_dir
         self.db_path = db_path
+        # Optional test/plugin hook: factory(cfg) -> object with list_spaces()
+        self.confluence_factory = confluence_factory
+        self.spaces_cache: dict[str, Any] | None = None
+        self.spaces_lock = threading.Lock()
+        self.spaces_fetch_lock = threading.Lock()
         super().__init__(server_address, RequestHandlerClass)
 
 
@@ -274,6 +286,8 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._handle_api_settings, {"GET", "PUT"}, []
         if path == "/api/settings/test":
             return self._handle_api_settings_test, {"POST"}, []
+        if path == "/api/spaces":
+            return self._handle_api_spaces, {"GET"}, []
         if path == "/api/jobs":
             return self._handle_api_jobs, {"POST"}, []
         if path == "/api/jobs/current":
@@ -299,6 +313,8 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/graph":
             return self._handle_api_graph, {"GET"}, []
+        if path == "/api/top-documents":
+            return self._handle_api_top_documents, {"GET"}, []
         if path == "/api/stats":
             return self._handle_api_stats, {"GET"}, []
 
@@ -376,6 +392,12 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         updated = self.server.config_store.update(data)
+        # Connection settings changed -> a cached space list may be stale.
+        # Selecting spaces (crawl defaults) must not invalidate it.
+        conf_keys = set((data.get("confluence") or {}).keys())
+        if conf_keys & {"base_url", "aliases", "api_mode", "auth"} or "http" in data:
+            with self.server.spaces_lock:
+                self.server.spaces_cache = None
         self.send_json(200, updated)
 
     def _handle_api_settings_test(self, method: str, parsed: urllib.parse.SplitResult) -> None:
@@ -408,29 +430,9 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
             result["confluence"] = {"ok": False, "message": "Nicht konfiguriert"}
         else:
             try:
-                from . import confluence
-
-                budget = atlassian_http.RequestBudget(5, 60.0)
-                stop_ev = threading.Event()
-                auth_headers = atlassian_http.build_auth_headers(conf_cfg.get("auth"))
-                allowed_bases = [conf_base] + [
-                    a.strip().rstrip("/") for a in conf_cfg.get("aliases", []) if a and isinstance(a, str) and a.strip()
-                ]
-                rl_client = atlassian_http.RateLimitedClient(
-                    "confluence",
-                    conf_base,
-                    allowed_bases=allowed_bases,
-                    sleep_seconds=0.0,
-                    timeout=timeout,
-                    max_retries=0,
-                    stop_event=stop_ev,
-                    budget=budget,
-                    ssl_context=ssl_ctx,
-                    auth_headers=auth_headers,
-                    user_agent=user_agent,
-                    transport=transport,
+                client = self._build_confluence_client(
+                    cfg, max_requests=5, max_duration_seconds=60.0, max_retries=0
                 )
-                client = confluence.ConfluenceClient(rl_client, conf_cfg.get("api_mode", "server"), ctx)
                 result["confluence"] = client.test_connection()
             except Exception as exc:
                 logger.warning("Confluence test_connection Fehler: %s", exc, exc_info=True)
@@ -472,6 +474,123 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
                 result["jira"] = {"ok": False, "message": str(exc)}
 
         self.send_json(200, result)
+
+    def _build_confluence_client(
+        self,
+        cfg: dict,
+        *,
+        max_requests: int,
+        max_duration_seconds: float,
+        max_retries: int | None = None,
+    ) -> Any:
+        """Short-lived ConfluenceClient with its own budget and stop event."""
+        from . import atlassian_http, confluence, links
+
+        http_cfg = cfg.get("http", {})
+        crawl_defaults = cfg.get("crawl_defaults", {})
+        conf_cfg = cfg.get("confluence", {})
+        base = (conf_cfg.get("base_url") or "").strip().rstrip("/")
+        allowed_bases = [base] + [
+            a.strip().rstrip("/")
+            for a in conf_cfg.get("aliases", [])
+            if isinstance(a, str) and a.strip()
+        ]
+        rl_client = atlassian_http.RateLimitedClient(
+            "confluence",
+            base,
+            allowed_bases=allowed_bases,
+            sleep_seconds=0.0,
+            timeout=float(crawl_defaults.get("request_timeout_seconds", 20.0)),
+            max_retries=(
+                int(crawl_defaults.get("max_retries", 4)) if max_retries is None else max_retries
+            ),
+            stop_event=threading.Event(),
+            budget=atlassian_http.RequestBudget(max_requests, max_duration_seconds),
+            ssl_context=atlassian_http.make_ssl_context(
+                http_cfg.get("verify_ssl", False), http_cfg.get("ca_bundle", "")
+            ),
+            auth_headers=atlassian_http.build_auth_headers(conf_cfg.get("auth")),
+            user_agent=http_cfg.get("user_agent", "local-knowledge/1.0"),
+            transport=atlassian_http.default_transport(http_cfg.get("use_system_proxy", True)),
+        )
+        return confluence.ConfluenceClient(
+            rl_client, conf_cfg.get("api_mode", "server"), links.LinkContext.from_config(cfg)
+        )
+
+    def _handle_api_spaces(self, method: str, parsed: urllib.parse.SplitResult) -> None:
+        """GET /api/spaces[?refresh=1] – list all visible Confluence spaces."""
+        params = urllib.parse.parse_qs(parsed.query)
+        force = params.get("refresh", ["0"])[0].strip().lower() in ("1", "true", "yes")
+
+        cfg = self.server.config_store.get()
+        conf_base = (cfg.get("confluence", {}).get("base_url") or "").strip()
+        if not conf_base:
+            self.send_error_json(
+                400, "bad_request", "Confluence-Basis-URL ist nicht konfiguriert (Einstellungen)"
+            )
+            return
+
+        def fresh_cache() -> dict[str, Any] | None:
+            cached = self.server.spaces_cache
+            if not cached or force:
+                return None
+            age = time.time() - float(cached.get("fetched_at_ts", 0.0))
+            return cached if age < SPACES_CACHE_TTL_SECONDS else None
+
+        cached = fresh_cache()
+        if cached:
+            self.send_json(200, {
+                "spaces": cached["spaces"],
+                "fetched_at": cached["fetched_at"],
+                "cached": True,
+            })
+            return
+
+        # Serialize concurrent fetches: the second request reuses the fresh cache.
+        with self.server.spaces_fetch_lock:
+            cached = fresh_cache()
+            if cached:
+                self.send_json(200, {
+                    "spaces": cached["spaces"],
+                    "fetched_at": cached["fetched_at"],
+                    "cached": True,
+                })
+                return
+            stale = self.server.spaces_cache
+            try:
+                factory = self.server.confluence_factory
+                if factory is not None:
+                    client = factory(cfg)
+                else:
+                    client = self._build_confluence_client(
+                        cfg, max_requests=SPACES_MAX_REQUESTS,
+                        max_duration_seconds=SPACES_BUDGET_SECONDS,
+                    )
+                spaces = client.list_spaces()
+            except Exception as exc:
+                logger.warning("Spaces konnten nicht geladen werden: %s", exc, exc_info=True)
+                if stale:
+                    self.send_json(200, {
+                        "spaces": stale["spaces"],
+                        "fetched_at": stale["fetched_at"],
+                        "cached": True,
+                        "stale": True,
+                        "warning": str(exc),
+                    })
+                    return
+                self.send_error_json(
+                    502, "upstream_error", f"Spaces konnten nicht geladen werden: {exc}"
+                )
+                return
+
+            fetched_at = db.now_iso()
+            with self.server.spaces_lock:
+                self.server.spaces_cache = {
+                    "spaces": spaces,
+                    "fetched_at": fetched_at,
+                    "fetched_at_ts": time.time(),
+                }
+        self.send_json(200, {"spaces": spaces, "fetched_at": fetched_at, "cached": False})
 
     def _handle_api_jobs(self, method: str, parsed: urllib.parse.SplitResult) -> None:
         data = self._parse_json_body(allow_empty=False)
@@ -594,6 +713,53 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
         )
         self.send_json(200, subgraph)
 
+    def _handle_api_top_documents(self, method: str, parsed: urllib.parse.SplitResult) -> None:
+        params = urllib.parse.parse_qs(parsed.query)
+        limit = 50
+        offset = 0
+        types_param = "all"
+        project_param = None
+        q_param = None
+
+        if "limit" in params:
+            try:
+                limit = int(params["limit"][0])
+            except ValueError:
+                self.send_error_json(400, "bad_request", "limit muss eine Ganzzahl sein")
+                return
+
+        if "offset" in params:
+            try:
+                offset = int(params["offset"][0])
+            except ValueError:
+                self.send_error_json(400, "bad_request", "offset muss eine Ganzzahl sein")
+                return
+
+        if "types" in params and params["types"][0]:
+            types_param = params["types"][0]
+            if types_param not in ("all", "confluence", "jira"):
+                self.send_error_json(400, "bad_request", f"Ungültiger Typ: {types_param}")
+                return
+
+        if "project" in params and params["project"][0]:
+            project_param = params["project"][0].strip() or None
+
+        if "q" in params and params["q"][0]:
+            q_param = params["q"][0].strip() or None
+
+        from . import graph
+
+        conn = get_db_connection(self.server.db_path)
+        data = graph.get_top_documents(
+            conn,
+            limit=limit,
+            offset=offset,
+            types=types_param,
+            project=project_param,
+            query=q_param,
+        )
+        self.send_json(200, data)
+
     def _handle_api_stats(self, method: str, parsed: urllib.parse.SplitResult) -> None:
         conn = get_db_connection(self.server.db_path)
         stats = db.get_stats(conn)
@@ -626,11 +792,15 @@ def create_server(
     port: int,
     web_dir: str | Path | None = None,
     db_path: str | Path | None = None,
+    confluence_factory: Any | None = None,
 ) -> KnowledgeServer:
     """Create and return a configured ThreadingHTTPServer instance."""
     web_path = Path(web_dir) if web_dir is not None else (config.PROJECT_ROOT / "web")
     database_path = Path(db_path) if db_path is not None else config.resolve_db_path(config_store.get())
-    return KnowledgeServer((host, port), KnowledgeRequestHandler, config_store, job_manager, web_path, database_path)
+    return KnowledgeServer(
+        (host, port), KnowledgeRequestHandler, config_store, job_manager, web_path, database_path,
+        confluence_factory=confluence_factory,
+    )
 
 
 class _IPv6KnowledgeServer(KnowledgeServer):

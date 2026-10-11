@@ -21,7 +21,12 @@ def _chunks(items: Sequence[int], size: int = _SQL_CHUNK) -> Iterable[Sequence[i
         yield items[i:i + size]
 
 
-def _make_node_dict(doc_row: sqlite3.Row | dict[str, Any], degree: int = 0) -> dict[str, Any]:
+def _make_node_dict(
+    doc_row: sqlite3.Row | dict[str, Any],
+    degree: int = 0,
+    in_degree: int = 0,
+    out_degree: int = 0,
+) -> dict[str, Any]:
     """Format standard graph node dictionary."""
     return {
         "uid": doc_row["uid"],
@@ -33,24 +38,31 @@ def _make_node_dict(doc_row: sqlite3.Row | dict[str, Any], degree: int = 0) -> d
         "document_type": doc_row["document_type"],
         "status": doc_row["status_label"],
         "degree": degree,
+        "in_degree": in_degree,
+        "out_degree": out_degree,
     }
 
 
-def _load_edge_index(conn: sqlite3.Connection, edge_kinds: set[str] | None
-                     ) -> tuple[list[tuple[int, int, int]], dict[int, int]]:
-    """All (edge_id, source, target) of the allowed kinds plus total degrees per doc.
+def _load_edge_index(
+    conn: sqlite3.Connection, edge_kinds: set[str] | None
+) -> tuple[list[tuple[int, int, int]], dict[int, int], dict[int, int], dict[int, int]]:
+    """All (edge_id, source, target) of the allowed kinds plus degree, in_degree, out_degree per doc.
 
     Loading the compact edge list once is far cheaper than one query per BFS node and
     keeps large subgraphs (thousands of nodes) fast.
     """
     edges: list[tuple[int, int, int]] = []
     degree: dict[int, int] = defaultdict(int)
+    in_degree: dict[int, int] = defaultdict(int)
+    out_degree: dict[int, int] = defaultdict(int)
     for eid, s, t, kind in conn.execute("SELECT id, source_doc, target_doc, kind FROM edges"):
         degree[s] += 1
         degree[t] += 1
+        out_degree[s] += 1
+        in_degree[t] += 1
         if edge_kinds is None or kind in edge_kinds:
             edges.append((eid, s, t))
-    return edges, degree
+    return edges, degree, in_degree, out_degree
 
 
 def _fetch_nodes(conn: sqlite3.Connection, ids: Sequence[int]) -> dict[int, sqlite3.Row]:
@@ -116,7 +128,7 @@ def get_subgraph(
             return None
         center_id = row["id"]
 
-    edges, degree = _load_edge_index(conn, kinds)
+    edges, degree, in_degree, out_degree = _load_edge_index(conn, kinds)
     type_of: dict[int, str] = {}
     if types != "all" or center_id is None:
         type_of = {r[0]: r[1] for r in conn.execute("SELECT id, source_type FROM documents")}
@@ -165,7 +177,15 @@ def get_subgraph(
     selected_set = set(selected)
     rows = _fetch_nodes(conn, selected)
     order = sorted(selected_set, key=lambda d: (0 if d == center_id else 1, -degree.get(d, 0), rows[d]["uid"]))
-    nodes = [_make_node_dict(rows[d], degree.get(d, 0)) for d in order if d in rows]
+    nodes = [
+        _make_node_dict(
+            rows[d],
+            degree.get(d, 0),
+            in_degree.get(d, 0),
+            out_degree.get(d, 0),
+        )
+        for d in order if d in rows
+    ]
     edge_ids = [eid for eid, s, t in edges if s in selected_set and t in selected_set]
     return {
         "center": center,
@@ -528,4 +548,101 @@ def find_related(
         "uid": uid,
         "total_returned": len(final_related),
         "related": final_related,
+    }
+
+
+def get_top_documents(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    types: str = "all",
+    project: str | None = None,
+    query: str | None = None,
+) -> dict[str, Any]:
+    """Return documents ranked by how many other documents link to them (incoming count / importance).
+
+    Args:
+        conn: sqlite3 connection
+        limit: maximum documents to return (1..500)
+        offset: pagination offset (>=0)
+        types: 'all', 'confluence', or 'jira'
+        project: optional space_or_project filter
+        query: optional text search in title, uid, or source_id
+
+    Returns:
+        dict with total, limit, offset, and documents list.
+    """
+    if types not in ("all", "confluence", "jira"):
+        raise ValueError(f"Invalid types: {types!r}; must be one of 'all', 'confluence', 'jira'")
+    eff_limit = max(1, min(int(limit), 500))
+    eff_offset = max(0, int(offset))
+
+    where_clauses: list[str] = []
+    params: list[Any] = []
+
+    if types != "all":
+        where_clauses.append("d.source_type = ?")
+        params.append(types)
+
+    if project:
+        where_clauses.append("d.space_or_project = ?")
+        params.append(project)
+
+    if query and query.strip():
+        q_clean = query.strip()
+        where_clauses.append("(d.title LIKE ? OR d.uid LIKE ? OR d.source_id LIKE ?)")
+        pattern = f"%{q_clean}%"
+        params.extend([pattern, pattern, pattern])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    count_sql = f"SELECT COUNT(*) FROM documents d {where_sql}"
+    total = conn.execute(count_sql, params).fetchone()[0]
+
+    sql = f"""
+        SELECT d.id, d.uid, d.source_type, d.source_id, d.title, d.url,
+               d.space_or_project, d.document_type, d.status_label, d.state,
+               COALESCE(inc.cnt, 0) AS incoming_count,
+               COALESCE(outg.cnt, 0) AS outgoing_count
+        FROM documents d
+        LEFT JOIN (
+            SELECT target_doc, COUNT(*) AS cnt
+            FROM edges
+            GROUP BY target_doc
+        ) inc ON inc.target_doc = d.id
+        LEFT JOIN (
+            SELECT source_doc, COUNT(*) AS cnt
+            FROM edges
+            GROUP BY source_doc
+        ) outg ON outg.source_doc = d.id
+        {where_sql}
+        ORDER BY incoming_count DESC, outgoing_count DESC, d.id ASC
+        LIMIT ? OFFSET ?
+    """
+    rows = conn.execute(sql, (*params, eff_limit, eff_offset)).fetchall()
+    documents: list[dict[str, Any]] = []
+    for r in rows:
+        inc_c = int(r["incoming_count"])
+        out_c = int(r["outgoing_count"])
+        documents.append({
+            "uid": r["uid"],
+            "type": r["source_type"],
+            "source_id": r["source_id"],
+            "title": r["title"],
+            "url": r["url"],
+            "project": r["space_or_project"],
+            "document_type": r["document_type"],
+            "status": r["status_label"],
+            "state": r["state"],
+            "incoming_count": inc_c,
+            "outgoing_count": out_c,
+            "total_degree": inc_c + out_c,
+        })
+
+    return {
+        "total": total,
+        "limit": eff_limit,
+        "offset": eff_offset,
+        "documents": documents,
     }

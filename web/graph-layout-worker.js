@@ -38,12 +38,27 @@ function buildAdjacency(n, links) {
   return { deg, start, adj };
 }
 
-function initialPositions(n, radii, graph, center, x, y) {
+function initialPositions(n, radii, graph, center, x, y, importanceMode, importance) {
   const { deg, start, adj } = graph;
   let avgR = 0;
   for (let i = 0; i < n; i++) avgR += radii[i];
   avgR = n ? avgR / n : 10;
   const slot = 2 * avgR + PADDING + 8;
+
+  if (importanceMode) {
+    // In importance mode, the most important (highest in-degree) nodes start at the center
+    const byImp = Array.from({ length: n }, (_, i) => i).sort((a, b) => {
+      const impDiff = (importance ? importance[b] : 0) - (importance ? importance[a] : 0);
+      return impDiff || deg[b] - deg[a] || a - b;
+    });
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    byImp.forEach((v, idx) => {
+      const r = slot * 0.75 * Math.sqrt(idx + 0.3);
+      x[v] = Math.cos(idx * golden) * r + jitter(v);
+      y[v] = Math.sin(idx * golden) * r + jitter(v + 7);
+    });
+    return;
+  }
 
   // BFS order (from center, else component-wise from highest degree nodes).
   const order = [];
@@ -337,6 +352,8 @@ function* layoutSteps(msg, post) {
   const radii = msg.radii;
   const links = msg.links;
   const center = msg.center;
+  const importanceMode = Boolean(msg.importanceMode);
+  const importance = msg.importance;
   const x = new Float64Array(n), y = new Float64Array(n);
   const vx = new Float64Array(n), vy = new Float64Array(n);
   const positions = new Float32Array(2 * n);
@@ -347,7 +364,16 @@ function* layoutSteps(msg, post) {
   if (n === 0) { emit('done', 1); return; }
 
   const graph = buildAdjacency(n, links);
-  initialPositions(n, radii, graph, center, x, y);
+  initialPositions(n, radii, graph, center, x, y, importanceMode, importance);
+
+  let minImp = Infinity, maxImp = -Infinity;
+  if (importanceMode && importance) {
+    for (let i = 0; i < n; i++) {
+      if (importance[i] < minImp) minImp = importance[i];
+      if (importance[i] > maxImp) maxImp = importance[i];
+    }
+  }
+  const impSpan = maxImp > minImp ? maxImp - minImp : 0;
   if (n === 1) { emit('done', 1); return; }
 
   let maxR = 0;
@@ -400,8 +426,16 @@ function* layoutSteps(msg, post) {
     tree.build(n, x, y, strength, next);
     for (let i = 0; i < n; i++) tree.applyCharge(i, x, y, vx, vy, strength, alpha, stack, theta2);
 
-    // weak gravity keeps disconnected components together
-    for (let i = 0; i < n; i++) { vx[i] -= x[i] * GRAVITY * alpha; vy[i] -= y[i] * GRAVITY * alpha; }
+    // gravity: in importance mode, important nodes have stronger central pull
+    for (let i = 0; i < n; i++) {
+      let g = GRAVITY;
+      if (importanceMode && impSpan > 0) {
+        const ratio = (importance[i] - minImp) / impSpan;
+        g = GRAVITY * (0.6 + 2.8 * ratio);
+      }
+      vx[i] -= x[i] * g * alpha;
+      vy[i] -= y[i] * g * alpha;
+    }
 
     // collision
     resolveCollisions(grid, n, x, y, vx, vy, radii, maxR, 0.7, false);

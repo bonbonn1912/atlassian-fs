@@ -73,6 +73,12 @@ class TestGraph(unittest.TestCase):
         # Center must be first node in deterministic ordering
         self.assertEqual(sub["nodes"][0]["uid"], "jira:B")
 
+        # In-degree and out-degree must be reported on nodes
+        b_node = next(n for n in sub["nodes"] if n["uid"] == "jira:B")
+        self.assertEqual(b_node["in_degree"], 1)
+        self.assertEqual(b_node["out_degree"], 2)
+        self.assertEqual(b_node["degree"], 3)
+
         # Edges must only be between included nodes
         for e in sub["edges"]:
             self.assertIn(e["source"], node_uids)
@@ -220,6 +226,44 @@ class TestGraph(unittest.TestCase):
         c_entry = next(r for r in related["related"] if r["uid"] == "confluence:C")
         self.assertEqual(c_entry["shared_count"], 1)
         self.assertFalse(c_entry["is_direct"])
+
+    def test_get_top_documents(self) -> None:
+        # Add an extra link pointing to jira:B to make it the top linked document (2 incoming)
+        # D -> B
+        db.add_edge(self.conn, "jira:D", models.LinkTarget(uid="jira:B", kind="links_to"))
+
+        res = graph.get_top_documents(self.conn, limit=10)
+        self.assertGreaterEqual(res["total"], 6)
+        docs = res["documents"]
+        # jira:B should be rank 1 with 2 incoming links
+        self.assertEqual(docs[0]["uid"], "jira:B")
+        self.assertEqual(docs[0]["incoming_count"], 2)
+        self.assertEqual(docs[0]["outgoing_count"], 2)
+        self.assertEqual(docs[0]["total_degree"], 4)
+
+        # Type filter: only confluence
+        conf_res = graph.get_top_documents(self.conn, types="confluence")
+        for d in conf_res["documents"]:
+            self.assertEqual(d["type"], "confluence")
+
+        # Project filter: HR
+        hr_res = graph.get_top_documents(self.conn, project="HR")
+        for d in hr_res["documents"]:
+            self.assertEqual(d["project"], "HR")
+
+        # Query filter: "Issue D"
+        q_res = graph.get_top_documents(self.conn, query="Issue D")
+        self.assertEqual(len(q_res["documents"]), 1)
+        self.assertEqual(q_res["documents"][0]["uid"], "jira:D")
+
+        # Pagination: limit=2, offset=1
+        page = graph.get_top_documents(self.conn, limit=2, offset=1)
+        self.assertEqual(len(page["documents"]), 2)
+        self.assertEqual(page["documents"][0]["uid"], docs[1]["uid"])
+
+        # Invalid type check
+        with self.assertRaises(ValueError):
+            graph.get_top_documents(self.conn, types="invalid_type")
 
 
 if __name__ == "__main__":

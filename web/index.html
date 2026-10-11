@@ -41,6 +41,9 @@
           <button type="button" role="tab" id="tab-graph" class="nav-tab" aria-selected="false" aria-controls="panel-graph" tabindex="-1">
             <span class="tab-label">Graph</span>
           </button>
+          <button type="button" role="tab" id="tab-top" class="nav-tab" aria-selected="false" aria-controls="panel-top" tabindex="-1">
+            <span class="tab-label">Top-Dokumente</span>
+          </button>
           <button type="button" role="tab" id="tab-settings" class="nav-tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1">
             <span class="tab-label">Einstellungen</span>
           </button>
@@ -132,7 +135,7 @@
             </div>
             <div class="indexing-header-actions">
               <button type="button" class="btn btn-secondary" id="job-refresh-existing-btn" title="Aktualisiert nur bereits indexierte Dokumente aus Confluence/Jira">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-right: 6px;"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="btn-leading-icon"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
                 Bestehende aktualisieren (Refresh existing)
               </button>
             </div>
@@ -205,6 +208,10 @@
                 <span class="counter-label">Queue-Größe</span>
                 <span class="counter-val" id="job-queue-size">0</span>
               </div>
+              <div class="counter-item">
+                <span class="counter-label" title="Bereits indexierte Dokumente, die ohne neuen Abruf übernommen wurden">Wiederverwendet</span>
+                <span class="counter-val" id="job-reused">0</span>
+              </div>
             </div>
 
             <!-- Current UID & Message -->
@@ -261,11 +268,30 @@
               <!-- Group 1: Start -->
               <fieldset class="form-fieldset">
                 <legend class="fieldset-legend">Einstieg</legend>
+                <div class="form-grid-2">
+                  <div class="form-group">
+                    <label for="job-start-page" class="field-label">Confluence-Start-URL oder Page-ID</label>
+                    <input type="text" id="job-start-page" name="start_page" class="text-input" placeholder="z. B. https://confluence.intern/display/SPACE/Titel oder 12345">
+                    <span class="field-hint">Vollständige URL einer Confluence-Seite, numerische Page-ID oder space:KEY.</span>
+                  </div>
                 <div class="form-group">
-                  <label for="job-start-page" class="field-label">Confluence-Start-URL oder Page-ID <span class="required-mark" aria-hidden="true">*</span></label>
-                  <input type="text" id="job-start-page" name="start_page" class="text-input" placeholder="z. B. https://confluence.intern/display/SPACE/Titel oder 12345" required>
-                  <span class="field-hint">Vollständige URL einer Confluence-Seite oder numerische Page-ID.</span>
+                  <label for="job-space-key" class="field-label">Oder Confluence Space-Key (Vollständiger Space-Crawl)</label>
+                  <input type="text" id="job-space-key" name="space_key" class="text-input" placeholder="z. B. PROJ, KAFKA oder TEAM">
+                  <span class="field-hint">Findet alle Seiten des Spaces über die Confluence Content API (inkl. isolierter Seiten ohne eingehende Links).</span>
                 </div>
+              </div>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="job-space-keys" class="field-label">Mehrere Spaces (kommagetrennt)</label>
+                  <input type="text" id="job-space-keys" name="space_keys" class="text-input" placeholder="z. B. PROJ, KAFKA, TEAM">
+                  <span class="field-hint">Space-Crawl für alle angegebenen Keys; hat Vorrang vor dem einzelnen Space-Key oben.</span>
+                </div>
+                <div class="form-group">
+                  <label for="job-modified-since" class="field-label">Nur Änderungen seit Datum (optional)</label>
+                  <input type="date" id="job-modified-since" name="modified_since" class="text-input">
+                  <span class="field-hint">Aktualisiert nur Seiten, die seit diesem Datum geändert wurden (z. B. „letzte Woche“ = Datum von vor 7 Tagen).</span>
+                </div>
+              </div>
               </fieldset>
 
               <!-- Group 2: Mengengrenzen -->
@@ -345,6 +371,11 @@
                     <label for="job-max-retries" class="field-label">Max. Retries</label>
                     <input type="number" id="job-max-retries" name="max_retries" class="number-input">
                     <span class="field-hint">Wiederholungsversuche bei 429/5xx</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-batch-fetch-size" class="field-label">Batch-Größe (Dokumente je Request)</label>
+                    <input type="number" id="job-batch-fetch-size" name="batch_fetch_size" class="number-input" min="1" max="100">
+                    <span class="field-hint">Confluence/Jira-Bulk: bis zu 100 Seiten bzw. Tickets pro API-Request (1–100)</span>
                   </div>
                 </div>
               </fieldset>
@@ -472,6 +503,16 @@
               </div>
             </details>
 
+            <div class="graph-toolbar-divider" aria-hidden="true"></div>
+
+            <button type="button" class="btn btn-secondary btn-sm" id="graph-importance-btn" title="Knoten nach Wichtigkeit (eingehende Links) skalieren und zentral anordnen" aria-pressed="false">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="btn-leading-icon">
+                <circle cx="12" cy="12" r="3"></circle>
+                <circle cx="12" cy="12" r="8" stroke-dasharray="2 2"></circle>
+              </svg>
+              <span>Wichtigkeits-Modus</span>
+            </button>
+
             <div class="graph-toolbar-spacer"></div>
 
             <div class="graph-zoom-controls">
@@ -555,6 +596,93 @@
         </div>
       </section>
 
+      <!-- TAB: TOP-DOKUMENTE -->
+      <section role="tabpanel" id="panel-top" class="tab-panel" aria-labelledby="tab-top" tabindex="0" hidden>
+        <div class="top-docs-container">
+          <div class="top-docs-header-row">
+            <div>
+              <h2 class="section-title">Wichtigste Dokumente (Top-Verlinkungen)</h2>
+              <p class="section-desc">Dokumente mit den meisten eingehenden Links – sortiert nach Relevanz im lokalen Wissensnetzwerk.</p>
+            </div>
+            <div class="top-docs-header-actions">
+              <button type="button" class="btn btn-secondary btn-sm" id="top-refresh-btn" title="Top-Dokumente neu laden">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="btn-leading-icon"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                Aktualisieren
+              </button>
+            </div>
+          </div>
+
+          <!-- Filterleiste -->
+          <div class="top-docs-filters-bar">
+            <div class="filter-group">
+              <span class="filter-label">Quelle:</span>
+              <div class="segmented-control" role="radiogroup" aria-label="Top-Dokumente Typfilter">
+                <input type="radio" name="top-type" id="top-type-all" value="all" checked>
+                <label for="top-type-all">Alle</label>
+
+                <input type="radio" name="top-type" id="top-type-confluence" value="confluence">
+                <label for="top-type-confluence">Confluence</label>
+
+                <input type="radio" name="top-type" id="top-type-jira" value="jira">
+                <label for="top-type-jira">Jira</label>
+              </div>
+            </div>
+
+            <div class="filter-group">
+              <label for="top-project-select" class="filter-label">Space / Projekt:</label>
+              <select id="top-project-select" class="select-input select-sm">
+                <option value="">Alle Spaces &amp; Projekte</option>
+              </select>
+            </div>
+
+            <div class="filter-group">
+              <label for="top-limit-select" class="filter-label">Limit:</label>
+              <select id="top-limit-select" class="select-input select-sm">
+                <option value="25">25</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+              </select>
+            </div>
+
+            <div class="filter-group top-search-group">
+              <label for="top-search-input" class="sr-only">Titel- oder Key-Filter</label>
+              <input type="search" id="top-search-input" class="search-input search-input-sm" placeholder="Nach Titel oder Key filtern …" autocomplete="off" spellcheck="false">
+            </div>
+          </div>
+
+          <!-- Meta-Bar mit Zähler -->
+          <div class="top-docs-meta-bar" id="top-meta-bar">
+            <span class="top-docs-meta-text" id="top-meta-text">Lade Daten …</span>
+          </div>
+
+          <!-- Tabelle -->
+          <div class="top-docs-table-wrapper">
+            <table class="top-docs-table" id="top-docs-table" aria-label="Meistverlinkte Dokumente">
+              <thead>
+                <tr>
+                  <th scope="col" class="th-rank">Rang</th>
+                  <th scope="col" class="th-incoming">Eingehende Links</th>
+                  <th scope="col" class="th-title">Dokument / Titel</th>
+                  <th scope="col" class="th-type">Typ</th>
+                  <th scope="col" class="th-space">Space / Projekt</th>
+                  <th scope="col" class="th-outgoing">Ausgehend</th>
+                  <th scope="col" class="th-status">Status</th>
+                  <th scope="col" class="th-actions">Aktionen</th>
+                </tr>
+              </thead>
+              <tbody id="top-docs-tbody">
+                <!-- Dynamisch befüllt -->
+              </tbody>
+            </table>
+          </div>
+
+          <div class="top-docs-empty-state" id="top-empty-state" hidden>
+            <p>Keine Dokumente gefunden. Starte einen Indexierungs-Job, um Dokumente und Verlinkungen zu erfassen.</p>
+          </div>
+        </div>
+      </section>
+
       <!-- TAB 4: EINSTELLUNGEN -->
       <section role="tabpanel" id="panel-settings" class="tab-panel" aria-labelledby="tab-settings" tabindex="0" hidden>
         <div class="settings-container">
@@ -622,6 +750,56 @@
                   <input type="password" id="setting-confluence-token" class="text-input" autocomplete="off" placeholder="Neues Token eingeben …">
                   <span class="token-status-badge" id="setting-confluence-token-status" hidden>Gespeichert</span>
                   <button type="button" class="btn btn-ghost btn-sm" id="setting-confluence-token-clear" hidden>Token entfernen</button>
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- Confluence spaces & incremental updates -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">Confluence-Spaces &amp; Aktualisierung</legend>
+
+              <div class="spaces-toolbar">
+                <button type="button" class="btn btn-secondary" id="spaces-load-btn">Spaces laden</button>
+                <input type="search" id="spaces-filter" class="text-input spaces-filter" placeholder="Nach Name oder Key filtern …" aria-label="Spaces filtern">
+                <button type="button" class="btn btn-ghost btn-sm" id="spaces-select-all">Alle auswählen</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="spaces-select-none">Auswahl aufheben</button>
+                <span class="spaces-status" id="spaces-status" aria-live="polite"></span>
+              </div>
+
+              <div class="spaces-list" id="spaces-list" role="group" aria-label="Verfügbare Confluence-Spaces">
+                <p class="spaces-empty">Spaces werden geladen …</p>
+              </div>
+
+              <div class="spaces-actions">
+                <button type="button" class="btn btn-primary" id="spaces-index-btn">Ausgewählte Spaces indexieren</button>
+                <span class="field-hint" id="spaces-selection-hint"></span>
+              </div>
+
+              <div class="spaces-modified">
+                <div class="form-group">
+                  <label for="setting-modified-since" class="field-label">Geänderte Seiten seit</label>
+                  <input type="date" id="setting-modified-since" class="text-input">
+                </div>
+                <div class="form-group">
+                  <label class="checkbox-control checkbox-margin-top">
+                    <input type="checkbox" id="setting-modified-scope-selected" checked>
+                    <span class="checkbox-label">Nur ausgewählte Spaces</span>
+                  </label>
+                </div>
+                <button type="button" class="btn btn-secondary" id="modified-index-btn">Geänderte Seiten indexieren</button>
+              </div>
+
+              <span class="field-hint">Der Änderungs-Modus lädt alle Seiten, die seit dem Datum zuletzt geändert wurden (Confluence CQL) und aktualisiert deren Index-Einträge – ideal für den regelmäßigen Abgleich, z. B. „seit letzter Woche“. Die Auswahl wird mit „Einstellungen speichern“ dauerhaft gespeichert.</span>
+            </fieldset>
+
+            <!-- Crawl-Standardwerte -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">Crawl-Standardwerte</legend>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-crawl-batch-fetch-size" class="field-label">Batch-Größe (Dokumente je API-Request, 1–100)</label>
+                  <input type="number" id="setting-crawl-batch-fetch-size" class="number-input" min="1" max="100">
+                  <span class="field-hint">Standard für neue Jobs: Confluence-Seiten bzw. Jira-Tickets, die mit einem Request vorgeladen werden. Pro Job änderbar im Reiter „Indexierung“ (Netzwerk &amp; Rate-Limiting).</span>
                 </div>
               </div>
             </fieldset>

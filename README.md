@@ -71,7 +71,10 @@ Klicken Sie im Reiter **Einstellungen** auf **Verbindung testen** (bzw. `POST /a
 ### 6. Erste Indexierung starten
 
 Starten Sie über den Reiter **Indexierung** einen Crawl:
-- **Startseite:** z. B. URL einer Confluence-Startseite, ein Confluence-Space-Key oder ein Jira-Projektkürzel (z. B. `PROJ`).
+- **Startseite:** URL oder Page-ID einer Confluence-Seite, `space:KEY` bzw. eine Space-URL
+  (`https://confluence.intern/display/KEY`) für einen kompletten Space-Crawl – oder eine
+  Space-Auswahl/`space_keys` (siehe Abschnitt 8). Jira-Inhalte werden über Links aus Confluence
+  bzw. in der Space-/Änderungs-Indexierung erreicht.
 - **Tiefen- und Mengenbeschränkungen:** Konfigurieren Sie Seiten-Limits, Traversierungstiefe und Request-Budgets.
 - Der Crawler analysiert HTML-Inhalte, extrahiert Hyperlinks und Jira-Issue-Keys (`PROJ-123`), chunked Inhalte und aktualisiert den FTS5-Index sowie den Wissensgraphen.
 
@@ -79,6 +82,48 @@ Starten Sie über den Reiter **Indexierung** einen Crawl:
 
 - **Suche:** Suchanfragen mit FTS5-Ranking (BM25), Filterung nach Typ (`confluence`, `jira`) oder Projekt.
 - **Graph:** Interaktiver Graph mit Nachbarschaftsanzeige (Hops 1–3), Kantentypen (`links_to`, `mentions_jira`, `jira_parent_of`, `parent_of` etc.).
+- **Top-Dokumente:** Rangliste der wichtigsten Dokumente (ein-/ausgehende Kanten); per Klick direkt
+  in Suche oder Graph springen (`GET /api/top-documents?types=&limit=&offset=&project=&q=`).
+
+### 8. Spaces auswählen & geänderte Seiten nachziehen
+
+Im Reiter **Einstellungen** gibt es den Abschnitt **Confluence-Spaces & Aktualisierung**:
+
+- **Spaces laden:** listet alle Confluence-Spaces auf, die mit dem konfigurierten Token sichtbar sind
+  (`GET /api/spaces`, 10 Minuten Cache, `?refresh=1` erzwingt einen neuen Abruf). Der Eintrag
+  `verify_ssl: false` gilt auch hier, self-signed Zertifikate sind also kein Hindernis.
+- **Auswahl:** Spaces ankreuzen und mit **Einstellungen speichern** dauerhaft in
+  `confluence.selected_spaces` ablegen. **Ausgewählte Spaces indexieren** startet sofort einen
+  Space-Crawl über alle markierten Spaces (inkl. isolierter Seiten ohne eingehende Links).
+  Alternativ lassen sich die Keys im Reiter **Indexierung** als kommagetrennte Liste
+  (`space_keys`) angeben.
+- **Geänderte Seiten seit Datum:** Datum wählen (Standard: vor 7 Tagen) und
+  **Geänderte Seiten indexieren** starten. Der Job fragt Confluence per CQL
+  (`type=page and lastmodified >= "<Datum>"`, optional `space in (...)`) ab und aktualisiert
+  genau diese Seiten – ideal für den regelmäßigen Abgleich, z. B. „alle Seiten seit letzter Woche“.
+  Der Modus ist auch als Job-Parameter `modified_since` verfügbar (ISO-Datum oder relativ
+  `7d` / `2w`). Bereits indexierte Seiten werden dabei erneut abgerufen, neue Links können
+  zusätzlich in den Index wandern.
+- **Der klassische Weg bleibt erhalten:** `start_page` (URL/Page-ID), ein einzelner
+  `space_key` und der bestehende `refresh_only`-Lauf funktionieren unverändert.
+
+### 9. Batch-Abruf (bis zu 100 Dokumente pro Request)
+
+Der Crawler lädt Dokumente gebündelt statt einzeln:
+
+- **Confluence:** `GET /rest/api/content/search?cql=id in (…,&limit=100` (Server/DC) bzw.
+  `GET /api/v2/pages?id=…&id=…&body-format=storage` (Cloud) – bis zu **100 Seiten in einem Request**
+  inkl. Body, Version, Space und Labels.
+- **Jira:** `GET /rest/api/2/search?jql=key in (…)&maxResults=100` (Server/DC) bzw.
+  `/rest/api/3/search/jql` mit Fallback auf `/rest/api/3/search` (Cloud) – bis zu **100 Tickets pro
+  Request**. Remote-Links bleiben Einzelrequests (`/issue/{key}/remotelink`), außer
+  `include_remote_links=false`.
+- **Stellschraube:** `batch_fetch_size` (1–100, Standard 100) im Reiter *Indexierung*
+  (Netzwerk & Rate-Limiting) bzw. in den Crawl-Standardwerten. Zusammen mit dem Sleep zwischen
+  Requests sinkt die Laufzeit grob auf `Seiten/100 × Sleep` statt `Seiten × Sleep`.
+- Auch die Auflistung nutzt 100 Einträge je Request (Spaces, Space-Seiten, CQL-Suche, Kindseiten).
+  Kindseiten (`include_child_pages`) und Titel-Auflösungen benötigen weiterhin je Dokument einen
+  Request – für maximale Geschwindigkeit diese Optionen bei reinen Space-Crawls abschalten.
 
 ---
 

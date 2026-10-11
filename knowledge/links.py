@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import urllib.parse
 from urllib.parse import parse_qs, unquote_plus, urlsplit, urlunsplit
 
-from knowledge.models import confluence_uid, jira_uid, unresolved_page_uid
+from knowledge.models import confluence_uid, is_document_uid, jira_uid, unresolved_page_uid
 
 # Issue key pattern: e.g. PROJ-123, ABC_DEF-99
 ISSUE_KEY_RE: re.Pattern = re.compile(r"\b[A-Z][A-Z0-9_]+-[1-9][0-9]*\b")
@@ -210,6 +210,13 @@ def _classify_absolute(parsed, ctx: LinkContext) -> tuple[str, str] | None:
             if title:
                 return unresolved_page_uid(space, title), evidence_url
 
+        # 5. /display/SPACE or /spaces/SPACE or /wiki/spaces/SPACE (space root)
+        m = re.match(r"^(?:/wiki)?/(?:display|spaces)/([^/?#]+)/?$", rel_path)
+        if m:
+            space = m.group(1).strip()  # case-sensitive for personal spaces
+            if space:
+                return f"space:{space}", evidence_url
+
         return None
 
     elif system_type == "jira":
@@ -241,6 +248,19 @@ def _classify_absolute(parsed, ctx: LinkContext) -> tuple[str, str] | None:
     return None
 
 
+def classify_document_url(href: str, ctx: LinkContext) -> tuple[str, str] | None:
+    """Like classify_url, but only for fetchable documents.
+
+    Space root URLs (`/display/ENG`, `/spaces/ENG`) classify to the pseudo uid
+    `space:ENG`, which is only meaningful as a start page – never as a graph
+    node. Those (and any other non-document uid) are dropped here.
+    """
+    classified = classify_url(href, ctx)
+    if not classified or not is_document_uid(classified[0]):
+        return None
+    return classified
+
+
 def parse_start_page(value: str, ctx: LinkContext) -> str | None:
     """Parse start_page parameter.
 
@@ -248,6 +268,7 @@ def parse_start_page(value: str, ctx: LinkContext) -> str | None:
     - digits -> confluence:<id>
     - Confluence URL -> classify_url(...)[0]
     - confluence:... as-is
+    - space:... as-is
     - invalid -> None
     """
     if not value or not isinstance(value, str):
@@ -260,6 +281,13 @@ def parse_start_page(value: str, ctx: LinkContext) -> str | None:
     if val.isdigit():
         return confluence_uid(val)
 
+    if val.startswith("space:"):
+        # Case is preserved: personal space keys ("~jsmith") are case-sensitive.
+        rest = val.split(":", 1)[1].strip()
+        if rest:
+            return f"space:{rest}"
+        return None
+
     if val.startswith("confluence:"):
         rest = val.split(":", 1)[1]
         if rest.isdigit() or rest.startswith("unresolved:"):
@@ -267,7 +295,7 @@ def parse_start_page(value: str, ctx: LinkContext) -> str | None:
         return None
 
     classified = classify_url(val, ctx)
-    if classified and classified[0].startswith("confluence:"):
+    if classified and (classified[0].startswith("confluence:") or classified[0].startswith("space:")):
         return classified[0]
 
     return None
@@ -288,22 +316,25 @@ def jira_issue_url(ctx: LinkContext, key: str) -> str:
 def find_plain_issue_keys(text: str, ctx: LinkContext) -> list[str]:
     """Find issue keys in plain text.
 
-    Unique, in order of appearance. Filtered by ctx.project_keys if configured.
+    Scans text with ISSUE_KEY_RE. If ctx.project_keys is configured, only matching
+    prefixes are returned. Results are uppercase and deduplicated preserving order.
     """
     if not text or not isinstance(text, str):
         return []
 
-    matches = ISSUE_KEY_RE.findall(text)
+    found = ISSUE_KEY_RE.findall(text)
+    out: list[str] = []
     seen: set[str] = set()
-    result: list[str] = []
 
-    for raw_k in matches:
-        k = raw_k.strip().upper()
-        proj = k.split("-", 1)[0]
-        if ctx.project_keys and proj not in ctx.project_keys:
+    for raw_k in found:
+        k = raw_k.upper()
+        if k in seen:
             continue
-        if k not in seen:
-            seen.add(k)
-            result.append(k)
+        if ctx.project_keys:
+            proj = k.split("-", 1)[0]
+            if proj not in ctx.project_keys:
+                continue
+        seen.add(k)
+        out.append(k)
 
-    return result
+    return out

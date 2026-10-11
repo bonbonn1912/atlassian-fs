@@ -6,6 +6,7 @@ All tests are hermetic and run in-memory without network calls.
 from __future__ import annotations
 
 import collections
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import threading
@@ -19,6 +20,7 @@ from knowledge.models import (
     AtlassianError,
     BudgetExceeded,
     Chunk,
+    CrawlStopped,
     EDGE_JIRA_PARENT_OF,
     EDGE_JIRA_RELATES_TO,
     EDGE_LINKS_TO,
@@ -57,13 +59,19 @@ class FakeConfluenceClient:
         title_resolutions: dict[tuple[str, str], str] | None = None,
         budget: RequestBudget | None = None,
         on_fetch: callable | None = None,
+        space_map: dict[str, list[tuple[str, str]]] | None = None,
+        modified_pages: list[dict] | None = None,
     ) -> None:
         self.pages = pages
         self.title_resolutions = title_resolutions or {}
         self.budget = budget
         self.on_fetch = on_fetch
+        self.space_map = space_map
+        self.modified_pages = modified_pages
         self.fetch_calls: list[str] = []
         self.resolve_calls: list[tuple[str, str]] = []
+        self.space_calls: list[str] = []
+        self.modified_calls: list[tuple[str, tuple[str, ...]]] = []
 
     def fetch_document(
         self,
@@ -89,6 +97,100 @@ class FakeConfluenceClient:
             self.budget.consume()
         self.resolve_calls.append((space, title))
         return self.title_resolutions.get((space, title))
+
+    def list_space_pages(self, space_key: str, max_items: int = 100_000) -> list[tuple[str, str]]:
+        if self.budget is not None:
+            self.budget.consume()
+        self.space_calls.append(space_key)
+        if self.space_map is not None:
+            return list(self.space_map.get(space_key, []))[:max_items]
+        results = []
+        for pid, doc in self.pages.items():
+            if not isinstance(doc, Exception):
+                if not getattr(doc, "space_or_project", None) or doc.space_or_project == space_key:
+                    results.append((pid, doc.title or f"Page {pid}"))
+            else:
+                results.append((pid, f"Page {pid}"))
+            if len(results) >= max_items:
+                break
+        return results
+
+    def list_pages_modified_since(
+        self,
+        since: str,
+        space_keys: list[str] | None = None,
+        max_items: int = 10_000,
+    ) -> list[dict]:
+        if self.budget is not None:
+            self.budget.consume()
+        self.modified_calls.append((since, tuple(space_keys or [])))
+        if self.modified_pages is not None:
+            return list(self.modified_pages)[:max_items]
+        out = []
+        for pid, doc in self.pages.items():
+            if isinstance(doc, Exception):
+                continue
+            out.append({
+                "id": pid,
+                "title": doc.title or "",
+                "space": getattr(doc, "space_or_project", "") or "",
+                "updated_at": getattr(doc, "source_updated_at", "") or "",
+            })
+            if len(out) >= max_items:
+                break
+        return out
+
+
+class FakeBulkConfluenceClient(FakeConfluenceClient):
+    """Like FakeConfluenceClient but with the bulk fetch API used for batching."""
+
+    def __init__(self, *args, space_parents: dict[str, str] | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.bulk_calls: list[list[str]] = []
+        self.bulk_include_children: list[bool] = []
+        self.space_parents = space_parents or {}
+        self.child_calls: list[str] = []
+
+    def list_space_pages_with_parents(
+        self, space_key: str, max_items: int = 100_000
+    ) -> list[tuple[str, str, str]]:
+        if self.space_parents:
+            if self.budget is not None:
+                self.budget.consume()
+            out = []
+            for pid, parent in self.space_parents.items():
+                doc = self.pages.get(pid)
+                title = doc.title if isinstance(doc, FetchedDocument) else f"Page {pid}"
+                out.append((pid, title or f"Page {pid}", parent))
+            return out[:max_items]
+        # No ancestor data configured -> behave like the plain listing
+        return [
+            (pid, title, "")
+            for pid, title in FakeConfluenceClient.list_space_pages(self, space_key, max_items)
+        ]
+
+    def enrich_children(self, doc: FetchedDocument, max_children: int = 500) -> None:
+        if self.budget is not None:
+            self.budget.consume()
+        self.child_calls.append(doc.source_id)
+
+    def fetch_documents_bulk(
+        self,
+        page_ids: list[str],
+        *,
+        include_children: bool = False,
+        max_children: int = 500,
+        scan_plain_keys: bool = False,
+    ) -> dict[str, FetchedDocument | Exception]:
+        if self.budget is not None:
+            self.budget.consume()
+        self.bulk_calls.append(list(page_ids))
+        self.bulk_include_children.append(bool(include_children))
+        out: dict[str, FetchedDocument | Exception] = {}
+        for pid in page_ids:
+            doc = self.pages.get(pid)
+            out[pid] = doc if doc is not None else NotFoundError(f"Confluence page not found: {pid}")
+        return out
 
 
 class FakeJiraClient:
@@ -123,6 +225,45 @@ class FakeJiraClient:
         if isinstance(doc, Exception):
             raise doc
         return doc
+
+
+class FakeBulkJiraClient(FakeJiraClient):
+    """Like FakeJiraClient but with the bulk fetch API used for batching."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.bulk_calls: list[list[str]] = []
+
+    def fetch_documents_bulk(
+        self,
+        issue_keys: list[str],
+        *,
+        include_remote_links: bool = True,
+        scan_plain_keys: bool = False,
+        chunk_size: int = 100,
+    ) -> dict[str, FetchedDocument | Exception]:
+        if self.budget is not None:
+            self.budget.consume()
+        self.bulk_calls.append(list(issue_keys))
+        out: dict[str, FetchedDocument | Exception] = {}
+        for key in issue_keys:
+            doc = self.issues.get(key)
+            out[key] = doc if doc is not None else NotFoundError(f"Jira issue not found: {key}")
+        return out
+
+
+class FakeBulkTitleConfluenceClient(FakeBulkConfluenceClient):
+    """Bulk client that also offers the batched title resolver."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.bulk_resolve_calls: list[list[tuple[str, str]]] = []
+
+    def resolve_titles_bulk(self, pairs, chunk_size: int = 50):
+        if self.budget is not None:
+            self.budget.consume()
+        self.bulk_resolve_calls.append(list(pairs))
+        return {key: self.title_resolutions.get(key) for key in pairs}
 
 
 def make_test_config(tmp_dir: Path) -> ConfigStore:
@@ -160,6 +301,7 @@ def make_doc(
     links: list[LinkTarget] | None = None,
     body: str = "Test body content",
     sections: list[tuple[str, str]] | None = None,
+    space_or_project: str | None = None,
 ) -> FetchedDocument:
     source_type, source_id = uid.split(":", 1)
     return FetchedDocument(
@@ -169,6 +311,7 @@ def make_doc(
         title=title,
         url=f"https://wiki.example.com/item/{source_id}",
         body_text=body,
+        space_or_project=space_or_project,
         sections=sections or [("Section 1", body)],
         links=links or [],
     )
@@ -634,6 +777,42 @@ class TestIndexer(unittest.TestCase):
         with self.assertRaises(ConfigError):
             mgr.start({"start_page": "1", "invalid_unexpected_field": 123})
 
+    def test_unresolved_titles_resolved_in_one_batch_and_cached(self) -> None:
+        """Multiple /display/SPACE/Title links cost one request; results are cached."""
+        links = [
+            LinkTarget(uid=unresolved_page_uid("ENG", "Titel 2"), kind=EDGE_LINKS_TO),
+            LinkTarget(uid=unresolved_page_uid("ENG", "Titel 3"), kind=EDGE_LINKS_TO),
+        ]
+        p1 = make_doc(confluence_uid("1"), "P1", links, space_or_project="ENG")
+        p2 = make_doc(confluence_uid("2"), "Titel 2", [], space_or_project="ENG")
+        p3 = make_doc(confluence_uid("3"), "Titel 3", [], space_or_project="ENG")
+        conf_client = FakeBulkTitleConfluenceClient(
+            {"1": p1, "2": p2, "3": p3},
+            title_resolutions={("ENG", "Titel 2"): "2", ("ENG", "Titel 3"): "3"},
+        )
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        st = wait_job_done(mgr, mgr.start({"start_page": "1"})["job_id"])
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 3)
+        self.assertEqual(len(conf_client.bulk_resolve_calls), 1)   # ein Sammel-Request
+        self.assertEqual(conf_client.bulk_resolve_calls[0],
+                         [("ENG", "Titel 2"), ("ENG", "Titel 3")])
+        self.assertEqual(conf_client.resolve_calls, [])           # kein Einzelabruf
+
+        # Zweiter Lauf: Auflösung kommt aus dem persistenten Cache (keine Requests)
+        st2 = wait_job_done(mgr, mgr.start({"start_page": "1"})["job_id"])
+        self.assertEqual(st2["state"], JOB_COMPLETED)
+        self.assertEqual(len(conf_client.bulk_resolve_calls), 1)
+        with db.connect(self.db_path) as conn:
+            known, page_id = db.get_title_resolution(conn, "ENG", "Titel 2")
+            self.assertTrue(known)
+            self.assertEqual(page_id, "2")
+
     def test_mark_interrupted_on_init(self) -> None:
         """Verify active jobs from previous process crashes are marked interrupted on init."""
         with db.connect(self.db_path) as conn:
@@ -854,6 +1033,506 @@ class TestIndexer(unittest.TestCase):
             # Check that p2 was not created as indexed
             doc2 = db.get_document(conn, confluence_uid("2"))
             self.assertTrue(doc2 is None or doc2["state"] != STATE_INDEXED)
+
+    def test_space_crawl_discovers_all_pages_including_orphans(self) -> None:
+        """Verify space_key crawl indexes all pages in the space including unlinked/orphan pages."""
+        p1 = make_doc(
+            confluence_uid("1"),
+            "Linked Page 1",
+            [LinkTarget(uid=confluence_uid("2"), kind=EDGE_LINKS_TO)],
+            space_or_project="MYSPACE",
+        )
+        p2 = make_doc(confluence_uid("2"), "Linked Page 2", [], space_or_project="MYSPACE")
+        # Page 3 is an isolated orphan page with no links to/from p1 or p2
+        p3 = make_doc(confluence_uid("3"), "Isolated Orphan Page", [], space_or_project="MYSPACE")
+
+        conf_client = FakeConfluenceClient({"1": p1, "2": p2, "3": p3})
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"space_key": "MYSPACE"})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 3)
+        self.assertEqual(set(conf_client.fetch_calls), {"1", "2", "3"})
+
+        with db.connect(self.db_path) as conn:
+            d3 = db.get_document(conn, confluence_uid("3"))
+            self.assertIsNotNone(d3)
+            self.assertEqual(d3["state"], STATE_INDEXED)
+            self.assertEqual(d3["title"], "Isolated Orphan Page")
+
+    def test_space_crawl_via_space_url(self) -> None:
+        """Verify start_page with space URL triggers space crawl."""
+        p1 = make_doc(confluence_uid("10"), "Root", [], space_or_project="KAFKA")
+        p2 = make_doc(confluence_uid("20"), "Orphan", [], space_or_project="KAFKA")
+
+        conf_client = FakeConfluenceClient({"10": p1, "20": p2})
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"start_page": "https://wiki.example.com/display/KAFKA"})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 2)
+        self.assertEqual(set(conf_client.fetch_calls), {"10", "20"})
+
+    def test_page_crawl_still_works_and_ignores_orphans(self) -> None:
+        """Verify legacy page crawl starting from page ID only follows links and does NOT crawl orphans."""
+        p1 = make_doc(
+            confluence_uid("1"),
+            "Page 1",
+            [LinkTarget(uid=confluence_uid("2"), kind=EDGE_LINKS_TO)],
+            space_or_project="TEAM",
+        )
+        p2 = make_doc(confluence_uid("2"), "Page 2", [], space_or_project="TEAM")
+        p3 = make_doc(confluence_uid("3"), "Orphan Page 3", [], space_or_project="TEAM")
+
+        conf_client = FakeConfluenceClient({"1": p1, "2": p2, "3": p3})
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"start_page": "1", "follow_confluence_links": True})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 2)
+        self.assertEqual(set(conf_client.fetch_calls), {"1", "2"})
+
+    def test_multi_space_crawl_indexes_all_selected_spaces(self) -> None:
+        """space_keys starts one crawl over every selected space (incl. orphans)."""
+        p1 = make_doc(confluence_uid("1"), "A1", [], space_or_project="ALPHA")
+        p2 = make_doc(confluence_uid("2"), "B1", [], space_or_project="BETA")
+        p3 = make_doc(confluence_uid("3"), "B2", [], space_or_project="BETA")
+
+        conf_client = FakeConfluenceClient(
+            {"1": p1, "2": p2, "3": p3},
+            space_map={"ALPHA": [("1", "A1")], "BETA": [("2", "B1"), ("3", "B2")]},
+        )
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"space_keys": ["ALPHA", "BETA"]})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 3)
+        self.assertEqual(set(conf_client.fetch_calls), {"1", "2", "3"})
+
+        with db.connect(self.db_path) as conn:
+            job = db.get_job(conn, res["job_id"])
+            self.assertEqual(job["start_page_uid"], "space:ALPHA,BETA")
+            d3 = db.get_document(conn, confluence_uid("3"))
+            self.assertEqual(d3["space_or_project"], "BETA")
+
+    def test_space_keys_preserve_case_for_personal_spaces(self) -> None:
+        """Personal space keys are case-sensitive and must not be uppercased."""
+        p1 = make_doc(confluence_uid("9"), "Persoenliche Seite", [], space_or_project="~jsmith")
+        conf_client = FakeConfluenceClient(
+            {"9": p1}, space_map={"~jsmith": [("9", "Persoenliche Seite")]},
+        )
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"space_keys": ["~jsmith"]})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(conf_client.space_calls, ["~jsmith"])
+        with db.connect(self.db_path) as conn:
+            self.assertEqual(db.get_job(conn, res["job_id"])["start_page_uid"], "space:~jsmith")
+
+    def test_single_space_crawl_still_works(self) -> None:
+        """The legacy single space_key path keeps working unchanged."""
+        p1 = make_doc(confluence_uid("1"), "A1", [], space_or_project="MYSPACE")
+        conf_client = FakeConfluenceClient({"1": p1})
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        st = wait_job_done(mgr, mgr.start({"space_key": "MYSPACE"})["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(conf_client.space_calls, ["MYSPACE"])
+
+    def test_modified_since_job_refreshes_changed_pages(self) -> None:
+        """modified_since refetches already indexed pages that changed since a date."""
+        p1 = make_doc(confluence_uid("1"), "Alter Titel", [], space_or_project="ENG")
+        conf_client = FakeConfluenceClient({"1": p1})
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        first_job = mgr.start({"start_page": "1"})
+        self.assertEqual(wait_job_done(mgr, first_job["job_id"])["state"], JOB_COMPLETED)
+        with db.connect(self.db_path) as conn:
+            self.assertEqual(db.get_document(conn, confluence_uid("1"))["title"], "Alter Titel")
+
+        conf_client.pages["1"] = make_doc(
+            confluence_uid("1"), "Neuer Titel", [], space_or_project="ENG"
+        )
+        conf_client.modified_pages = [{
+            "id": "1", "title": "Neuer Titel", "space": "ENG",
+            "updated_at": "2026-10-05T10:00:00.000Z",
+        }]
+
+        res = mgr.start({"modified_since": "2026-10-04", "space_keys": ["ENG"]})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(conf_client.modified_calls, [("2026-10-04", ("ENG",))])
+        self.assertEqual(conf_client.fetch_calls.count("1"), 2)  # fetched again
+        with db.connect(self.db_path) as conn:
+            job = db.get_job(conn, res["job_id"])
+            self.assertEqual(job["start_page_uid"], "recent:2026-10-04")
+            self.assertEqual(db.get_document(conn, confluence_uid("1"))["title"], "Neuer Titel")
+
+    def test_modified_since_without_results_completes(self) -> None:
+        """An update run without changed pages completes with a hint, not a failure."""
+        conf_client = FakeConfluenceClient({}, modified_pages=[])
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        st = wait_job_done(mgr, mgr.start({"modified_since": "2026-10-04"})["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertIn("Keine Seiten", st["last_message"])
+        self.assertEqual(conf_client.modified_calls, [("2026-10-04", ())])
+
+    def test_relative_modified_since_is_normalized(self) -> None:
+        """Relative values like 7d/2w are converted to an ISO date."""
+        conf_client = FakeConfluenceClient({}, modified_pages=[])
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"modified_since": "7d"})
+        st = wait_job_done(mgr, res["job_id"])
+
+        since = conf_client.modified_calls[0][0]
+        self.assertRegex(since, r"^\d{4}-\d{2}-\d{2}$")
+        expected = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
+        self.assertEqual(since, expected)
+        with db.connect(self.db_path) as conn:
+            self.assertEqual(
+                db.get_job(conn, res["job_id"])["start_page_uid"], f"recent:{expected}"
+            )
+
+    def test_invalid_modified_since_raises_config_error(self) -> None:
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (FakeConfluenceClient({}), None),
+        )
+        with self.assertRaises(ConfigError):
+            mgr.start({"modified_since": "irgendwann"})
+
+    def test_invalid_space_key_in_selection_raises_config_error(self) -> None:
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (FakeConfluenceClient({}), None),
+        )
+        with self.assertRaises(ConfigError):
+            mgr.start({"space_keys": ["ok", "böse"]})
+
+    def test_batch_prefetch_fetches_many_pages_with_one_request(self) -> None:
+        """A space crawl of 25 pages must need a single bulk request."""
+        page_ids = [str(i) for i in range(1, 26)]
+        pages = {
+            pid: make_doc(confluence_uid(pid), f"Seite {pid}", [], space_or_project="BIG")
+            for pid in page_ids
+        }
+        conf_client = FakeBulkConfluenceClient(
+            pages, space_map={"BIG": [(pid, f"Seite {pid}") for pid in page_ids]},
+        )
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"space_keys": ["BIG"], "batch_fetch_size": 100})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 25)
+        self.assertEqual(len(conf_client.bulk_calls), 1)
+        self.assertEqual(len(conf_client.bulk_calls[0]), 25)
+        self.assertEqual(conf_client.fetch_calls, [])  # kein Einzelabruf
+
+    def test_batch_prefetch_respects_batch_size(self) -> None:
+        """batch_fetch_size chunks the lookahead into multiple bulk requests."""
+        page_ids = ["1", "2", "3"]
+        pages = {
+            pid: make_doc(confluence_uid(pid), f"Seite {pid}", [], space_or_project="SMALL")
+            for pid in page_ids
+        }
+        conf_client = FakeBulkConfluenceClient(
+            pages, space_map={"SMALL": [(pid, f"Seite {pid}") for pid in page_ids]},
+        )
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"space_keys": ["SMALL"], "batch_fetch_size": 2})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 3)
+        self.assertEqual([len(call) for call in conf_client.bulk_calls], [2, 1])
+        self.assertEqual(conf_client.fetch_calls, [])
+
+    def test_batch_prefetch_includes_jira_issues(self) -> None:
+        """Bulk prefetch must cover Jira too (regression: jira_uid import)."""
+        p1 = make_doc(
+            confluence_uid("1"), "P1",
+            [LinkTarget(uid=jira_uid("PROJ-1"), kind=EDGE_MENTIONS_JIRA)],
+            space_or_project="ENG",
+        )
+        j1 = make_doc(jira_uid("PROJ-1"), "J1", [], space_or_project="PROJ")
+        conf_client = FakeBulkConfluenceClient(
+            {"1": p1}, space_map={"ENG": [("1", "P1")]},
+        )
+        jira_client = FakeBulkJiraClient({"PROJ-1": j1})
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, jira_client),
+        )
+
+        res = mgr.start({
+            "space_keys": ["ENG"], "batch_fetch_size": 100, "include_child_pages": False,
+        })
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 1)
+        self.assertEqual(st["jira_indexed"], 1)
+        self.assertEqual(conf_client.bulk_calls, [["1"]])
+        self.assertEqual(jira_client.bulk_calls, [["PROJ-1"]])
+        self.assertEqual(conf_client.fetch_calls, [])   # kein Einzelabruf
+        self.assertEqual(jira_client.fetch_calls, [])   # kein Einzelabruf
+
+    def test_space_crawl_derives_child_edges_without_extra_requests(self) -> None:
+        """Parent/child edges come from the listing (expand=ancestors), not per page."""
+        pages = {
+            "1": make_doc(confluence_uid("1"), "Root", [], space_or_project="TREE"),
+            "2": make_doc(confluence_uid("2"), "Kind 1", [], space_or_project="TREE"),
+            "3": make_doc(confluence_uid("3"), "Kind 2", [], space_or_project="TREE"),
+        }
+        conf_client = FakeBulkConfluenceClient(
+            pages, space_parents={"1": "", "2": "1", "3": "1"},
+        )
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"space_keys": ["TREE"], "batch_fetch_size": 100})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 3)
+        self.assertEqual(conf_client.bulk_include_children, [False])  # kein Kind-Request
+        self.assertEqual(conf_client.child_calls, [])                 # keine Extra-Requests
+        with db.connect(self.db_path) as conn:
+            children = {lk.uid for lk in db.get_outgoing_links(conn, confluence_uid("1"))}
+            self.assertEqual(children, {confluence_uid("2"), confluence_uid("3")})
+
+    def test_prefetch_continues_after_moved_key_alias(self) -> None:
+        """A prefetched uid that became 'seen' (moved key) must not stop batching."""
+        jira_links = [
+            LinkTarget(uid=jira_uid("OLD-1"), kind=EDGE_MENTIONS_JIRA),
+            LinkTarget(uid=jira_uid("NEW-1"), kind=EDGE_MENTIONS_JIRA),
+            LinkTarget(uid=jira_uid("PROJ-2"), kind=EDGE_MENTIONS_JIRA),
+            LinkTarget(uid=jira_uid("PROJ-3"), kind=EDGE_MENTIONS_JIRA),
+        ]
+        p1 = make_doc(confluence_uid("1"), "P1", jira_links, space_or_project="ENG")
+        moved = make_doc(jira_uid("NEW-1"), "Umgezogen", [], space_or_project="PROJ")
+        jira_client = FakeBulkJiraClient({
+            "OLD-1": moved, "NEW-1": moved,
+            "PROJ-2": make_doc(jira_uid("PROJ-2"), "J2", [], space_or_project="PROJ"),
+            "PROJ-3": make_doc(jira_uid("PROJ-3"), "J3", [], space_or_project="PROJ"),
+        })
+        conf_client = FakeBulkConfluenceClient(
+            {"1": p1}, space_map={"ENG": [("1", "P1")]},
+        )
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, jira_client),
+        )
+
+        res = mgr.start({
+            "space_keys": ["ENG"], "batch_fetch_size": 2, "include_child_pages": False,
+        })
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        # Second batch must happen even though NEW-1 stayed in the prefetch cache
+        self.assertEqual(
+            jira_client.bulk_calls,
+            [["OLD-1", "NEW-1"], ["PROJ-2", "PROJ-3"]],
+        )
+        self.assertEqual(jira_client.fetch_calls, [])  # kein Einzelabruf
+
+    def test_budget_exhaustion_still_indexes_prefetched_documents(self) -> None:
+        """Documents already fetched by the batch are stored even if the budget ran out."""
+        page_ids = ["1", "2", "3"]
+        pages = {
+            pid: make_doc(confluence_uid(pid), f"Seite {pid}", [], space_or_project="SMALL")
+            for pid in page_ids
+        }
+
+        def factory(cfg, params, stop_event, budget, on_event):
+            return FakeBulkConfluenceClient(
+                pages,
+                space_map={"SMALL": [(pid, f"Seite {pid}") for pid in page_ids]},
+                budget=budget,
+            ), None
+
+        mgr = JobManager(self.config_store, self.db_path, client_factory=factory)
+        res = mgr.start({
+            "space_keys": ["SMALL"], "batch_fetch_size": 100,
+            "include_child_pages": False, "max_api_requests": 2,
+        })
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 3)      # trotz Budget 2 vorab geladen
+        self.assertEqual(st["skipped"], 0)
+
+    def test_budget_drain_does_not_start_new_batches(self) -> None:
+        """With an exhausted budget the drain must not trigger another bulk request."""
+        page_ids = [str(i) for i in range(1, 9)]
+        pages = {
+            pid: make_doc(confluence_uid(pid), f"Seite {pid}", [], space_or_project="BIG")
+            for pid in page_ids
+        }
+
+        def factory(cfg, params, stop_event, budget, on_event):
+            return FakeBulkConfluenceClient(
+                pages,
+                space_map={"BIG": [(pid, f"Seite {pid}") for pid in page_ids]},
+                budget=budget,
+            ), None
+
+        mgr = JobManager(self.config_store, self.db_path, client_factory=factory)
+        res = mgr.start({
+            "space_keys": ["BIG"], "batch_fetch_size": 8,
+            "include_child_pages": False, "max_api_requests": 2,
+        })
+        st = wait_job_done(mgr, res["job_id"])
+
+        # 1 Space-Liste + 1 Bulk-Request = Budget 2; alle 8 vorab geladenen Seiten
+        # müssen trotzdem gespeichert werden (kein Nachladen, kein Verwerfen).
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertEqual(st["pages_indexed"], 8)
+        self.assertEqual(st["skipped"], 0)
+
+    def test_zero_page_budget_completes_instead_of_failing(self) -> None:
+        """max_confluence_pages=0 must not look like an empty (broken) space."""
+        conf_client = FakeConfluenceClient({"1": make_doc(confluence_uid("1"), "P1")})
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"space_key": "MYSPACE", "max_confluence_pages": 0})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertIn("max_confluence_pages ist 0", st["last_message"])
+        self.assertEqual(conf_client.space_calls, [])  # kein Request
+
+    def test_stop_during_recent_discovery_stops_job(self) -> None:
+        """Stopping the job while the CQL search runs must end as 'stopped'."""
+        conf_client = FakeConfluenceClient({}, modified_pages=[])
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        def on_list(since, space_keys=None, max_items=10_000):
+            raise CrawlStopped()
+
+        conf_client.list_pages_modified_since = on_list  # type: ignore[assignment]
+        res = mgr.start({"modified_since": "2026-10-04"})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_STOPPED)
+        self.assertEqual(st["last_message"], "Gestoppt")
+
+    def test_stop_during_start_page_title_resolution_stops_job(self) -> None:
+        """Stop during resolve_title() of the start page must not end as 'failed'."""
+        conf_client = FakeConfluenceClient({}, title_resolutions={})
+
+        def on_resolve(space, title):
+            raise CrawlStopped()
+
+        conf_client.resolve_title = on_resolve  # type: ignore[assignment]
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+
+        res = mgr.start({"start_page": "https://wiki.example.com/display/ENG/Titel"})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_STOPPED)
+        self.assertEqual(st["last_message"], "Gestoppt")
+
+    def test_budget_exceeded_during_space_discovery_completes(self) -> None:
+        """Budget exhaustion during the space listing ends 'completed', not 'failed'."""
+        conf_client = FakeConfluenceClient({})
+
+        def on_list(space_key, max_items=100_000):
+            raise BudgetExceeded("Request-Budget erschöpft (1/1)")
+
+        conf_client.list_space_pages = on_list  # type: ignore[assignment]
+        mgr = JobManager(
+            self.config_store,
+            self.db_path,
+            client_factory=lambda *args: (conf_client, None),
+        )
+        res = mgr.start({"space_key": "MYSPACE"})
+        st = wait_job_done(mgr, res["job_id"])
+
+        self.assertEqual(st["state"], JOB_COMPLETED)
+        self.assertIn("Budget erschöpft", st["last_message"])
 
 
 if __name__ == "__main__":

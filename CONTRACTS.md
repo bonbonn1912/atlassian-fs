@@ -34,7 +34,7 @@ konkreten Python-Schnittstellen. Alle Module halten sich exakt daran.
 `ConfigStore(path).get()` liefert ein Dict (siehe `DEFAULT_CONFIG`). Relevante Schlüssel:
 
 ```
-cfg["confluence"] = {base_url, api_mode, sleep_seconds, aliases, auth:{type,username,token}}
+cfg["confluence"] = {base_url, api_mode, sleep_seconds, aliases, selected_spaces, auth:{type,username,token}}
 cfg["jira"]       = {base_url, api_mode, sleep_seconds, aliases, project_keys, auth:{...}}
 cfg["http"]       = {verify_ssl, ca_bundle, use_system_proxy, max_response_mb, user_agent}
 cfg["crawl_defaults"], cfg["index"], cfg["search"], cfg["graph"], cfg["server"], cfg["database"]
@@ -42,7 +42,13 @@ cfg["crawl_defaults"], cfg["index"], cfg["search"], cfg["graph"], cfg["server"],
 
 `validate_job_params(payload, cfg) -> (params, errors)` – `params` enthält alle Felder aus
 `JOB_FIELD_SPECS` (inkl. `confluence_sleep_seconds`, `jira_sleep_seconds`,
-`request_timeout_seconds`, `max_retries`, `include_remote_links`, `resolve_page_titles`).
+`request_timeout_seconds`, `max_retries`, `include_remote_links`, `resolve_page_titles`,
+`space_keys`, `modified_since` und `batch_fetch_size`). `space_keys` wird als
+`spacekeylist` validiert (Format, Dedupe, Case bleibt erhalten); `modified_since` akzeptiert
+`JJJJ-MM-TT`, ISO-Zeitstempel (auch mit Zeitzone/`Z`) oder relativ (`7d`, `2w`) und wird auf
+ein ISO-Datum normalisiert. `ConfigStore` nutzt einen RLock (`update()` liest die Config beim
+Serialisieren erneut), prüft `graph.default_hops <= graph.max_hops`, wendet `apply_env_overrides`
+in `get()` an und schreibt `config.json` mit Rechten 0600.
 `ConfigStore.get_public()` = Config ohne Tokens (`auth.token=""`, `auth.token_set=bool`).
 `ConfigStore.update(patch)` validiert + speichert, wirft `ConfigError`.
 
@@ -214,18 +220,25 @@ class ConfluenceClient:
     def fetch_document(self, page_id: str, *, include_children: bool, max_children: int = 500,
                        scan_plain_keys: bool = False) -> FetchedDocument
     def list_child_pages(self, page_id: str, max_items: int) -> list[tuple[str, str]]  # (id, title)
+    def list_space_pages(self, space_key: str, max_items: int = 100_000) -> list[tuple[str, str]]
+    def list_spaces(self, max_items: int = 2000) -> list[dict]  # {key,name,type,id,url}
+    def list_pages_modified_since(self, since: str, space_keys: list[str] | None = None,
+                                  max_items: int = 10_000) -> list[dict]  # {id,title,space,updated_at}
+    def fetch_documents_bulk(self, page_ids: list[str], *, include_children: bool = False,
+                             max_children: int = 500, scan_plain_keys: bool = False,
+                             chunk_size: int = 100) -> dict[str, FetchedDocument | Exception]
     def resolve_title(self, space_key: str, title: str) -> str | None   # page id; None if 0 or >1 hits
     def test_connection(self) -> dict   # {"ok": bool, "message": str, ...}
 ```
 - **server**: `GET /rest/api/content/{id}?expand=body.storage,version,space,history.lastUpdated,ancestors`
   → `id,title,type,space.key,version.number,version.when,body.storage.value,_links.webui`.
-  Kinder: `GET /rest/api/content/{id}/child/page?limit=50&start=N`, Pagination über `_links.next`
+  Kinder: `GET /rest/api/content/{id}/child/page?limit=100&start=N`, Pagination über `_links.next`
   (relativ zu Context-Path! `_links.next` beginnt oft mit `/rest/...` ohne Context-Path →
   an `base_url` anhängen; falls schon mit Context-Path, nicht doppeln) bzw. `start+=size`
   solange `size==limit`. Titel-Resolver: `GET /rest/api/content?type=page&spaceKey=X&title=Y&limit=2`.
   Test: `GET /rest/api/space?limit=1`.
 - **cloud_v2**: `GET /api/v2/pages/{id}?body-format=storage` (base_url endet auf `/wiki`), Space-Key
-  über `GET /api/v2/spaces/{spaceId}` (pro spaceId gecacht), Kinder `GET /api/v2/pages/{id}/direct-children?limit=50`
+  über `GET /api/v2/spaces/{spaceId}` (pro spaceId gecacht), Kinder `GET /api/v2/pages/{id}/direct-children?limit=100`
   (nur `type=="page"`, Pagination `_links.next` relativ zu Host-Wurzel, z. B. `/wiki/api/v2/...`),
   Resolver `GET /rest/api/content?type=page&spaceKey=..&title=..` (v1 existiert in Cloud), Test `GET /api/v2/spaces?limit=1`.
 - Fehlt `body.storage.value` → `InvalidResponseError`. `type != "page"` (z. B. blogpost) wird trotzdem
@@ -235,6 +248,23 @@ class ConfluenceClient:
   source_version = Versionsnummer, source_updated_at = version.when / createdAt, links = Body-Links
   + Kinder (`parent_of`, source_field `"children"`, title_hint = Kindtitel).
   body_text via text.parse_confluence_storage, abgeschnitten auf index_cfg["max_document_chars"].
+- **Space-Discovery** (`list_spaces`): server `GET /rest/api/space?limit=100&start=N`,
+  cloud_v2 `GET /api/v2/spaces?limit=100` (Cursor über `_links.next`). Ergebnis dedupliziert,
+  nach Name sortiert; `url` = `base_url + /display/<key>` (server) bzw. `base_url + /spaces/<key>` (cloud).
+- **Änderungs-Suche** (`list_pages_modified_since`): CQL-Suche
+  `GET /rest/api/content/search?cql=type=page and lastmodified >= "<Datum>" [and space in (...)] order by lastmodified desc`
+  (existiert in Server/DC und Cloud), Pagination über `_links.next` bzw. `start+=size`.
+  Nur `type=="page"`-Treffer. Leeres `since` → leere Liste.
+- **Batch-Abruf** (`fetch_documents_bulk`, bis zu 100 IDs je Request): server
+  `GET /rest/api/content/search?cql=id in (1,2,...)&limit=100&expand=body.storage,version,space,history.lastUpdated,metadata.labels`,
+  cloud_v2 `GET /api/v2/pages?id=..&id=..&body-format=storage&limit=100` (Cursor via `_links.next`).
+  Ergebnis `{page_id: FetchedDocument|Exception}`; IDs, die die Antwort nicht enthält, werden
+  einzeln nachgeladen (nur so lässt sich 403 „forbidden" von 404 „missing" unterscheiden).
+  `include_children` kostet wie bisher
+  einen zusätzlichen Request je Seite (kein Bulk-Endpunkt vorhanden).
+  Listen-/Suchlimits sind auf 100 je Request erhöht (`CHILD_PAGE_SIZE`, `SPACE_PAGE_SIZE`,
+  `SEARCH_PAGE_SIZE`, `BULK_PAGE_SIZE`). `list_pages_modified_since` validiert Space-Keys
+  gegen `^[A-Za-z0-9_.~:@-]+$` (CQL-Injektion) und wirft sonst `ValueError`.
 
 ## Modul `knowledge/jira.py` (Agent „api“)
 
@@ -245,11 +275,21 @@ class JiraClient:
                  index_cfg: dict | None = None)
     def fetch_document(self, issue_key: str, *, include_remote_links: bool,
                        scan_plain_keys: bool = False) -> FetchedDocument
+    def fetch_documents_bulk(self, issue_keys: list[str], *, include_remote_links: bool = True,
+                             scan_plain_keys: bool = False,
+                             chunk_size: int = 100) -> dict[str, FetchedDocument | Exception]
     def test_connection(self) -> dict   # server_v2: GET /rest/api/2/serverInfo ; cloud_v3: /rest/api/3/serverInfo
 ```
 - **server_v2**: `GET /rest/api/2/issue/{KEY}?fields=...`, Beschreibung = Wiki-Markup-String
   (`text.jira_wiki_to_content`). Remote-Links `GET /rest/api/2/issue/{KEY}/remotelink`.
 - **cloud_v3**: `/rest/api/3/...`, Beschreibung = ADF (`text.adf_to_content`).
+- **Batch-Abruf** (`fetch_documents_bulk`, bis zu 100 Keys je Request):
+  server_v2 `GET /rest/api/2/search?jql=key in (A-1, A-2)&fields=...&maxResults=100&validateQuery=false`,
+  cloud_v3 `GET /rest/api/3/search/jql` mit Fallback auf das klassische `/rest/api/3/search`
+  (bei 400/404/405/410/501). Keys, die JQL nicht liefert (verschoben/gelöscht), werden einzeln
+  nachgeladen – dadurch bleibt die „moved key"-Erkennung (`uid` aus der Antwort) erhalten.
+  Remote-Links bleiben
+  Einzelrequests (`GET /issue/{key}/remotelink`), außer `include_remote_links=false`.
 - Antwort-Key kann vom angefragten Key abweichen (verschoben) → uid aus Antwort-Key.
 - Suchtext/body_text: `KEY + Summary + Beschreibung + Status + Typ + Labels + Components`
   (Section "" = Kopf mit Key/Summary/Status/Typ/Labels, danach Beschreibungsabschnitte).
@@ -289,6 +329,27 @@ wiederverwenden, Referenzknoten, `max_links_per_document` begrenzt nur das Einpl
 Fehler eines Dokuments brechen den Job nicht ab; `CrawlStopped` → `stopped`; `BudgetExceeded` → Job endet
 `completed` mit Meldung „Budget erschöpft …“; unerwartete Exception → `failed`). Fortschritt wird
 mindestens nach jedem Dokument in crawl_jobs geschrieben.
+
+Zusätzliche Start-Modi (alle abwärtskompatibel zu `start_page` / `space_key` / `refresh_only`):
+
+- `space_keys: ["A", "B"]` → Space-Crawl über mehrere Spaces (`start_page_uid = "space:A,B"`),
+  Seiten aller Spaces werden in einer Queue dedupliziert; ein nicht lesbarer Space wird geloggt
+  und übersprungen, erst wenn kein einziger Space Seiten liefert, schlägt der Job fehl.
+- `modified_since: "JJJJ-MM-TT"` (auch `7d`/`2w` oder ISO-Zeitstempel; wird auf ein Datum
+  normalisiert) → Änderungs-Crawl (`start_page_uid = "recent:<Datum>"`): Seiten aus
+  `ConfluenceClient.list_pages_modified_since` (optional gefiltert auf `space_keys`) werden
+  eingereiht und **immer neu abgerufen**, auch wenn sie bereits indexiert sind. Ohne Treffer endet
+  der Job erfolgreich mit Hinweis „Keine Seiten gefunden …“. Ausgehende Links werden normal
+  weiterverfolgt (bereits indexierte Ziele bleiben wiederverwendet).
+- Validierung: Space-Keys `^[A-Z0-9_~-]+$` (Großbuchstaben, dedupliziert), Datums-/Relativ-Format
+  sonst 400. Für `space_keys` gilt `^[A-Za-z0-9_.~:@-]+$` (case-sensitiv, Personal Spaces) und
+  Dedupe; ein einzelner `space_key` neben `modified_since` wird zum Filter `space_keys=[key]`.
+- **Batch-Prefetch im BFS-Loop**: Vor dem Abarbeiten schaut der Worker bis zu
+  `batch_fetch_size` (Default 100, Spec 1–100) noch nicht abgerufene Dokumente aus der Queue
+  voraus (getrennt nach Typ, begrenzt durch die Rest-Budgets) und lädt Confluence- und
+  Jira-Dokumente über `fetch_documents_bulk` in wenigen Requests. Clients ohne Bulk-API
+  (z. B. Test-Fakes) fallen automatisch auf Einzelabrufe zurück; pro Batch wird eine
+  Info-Logzeile „Batch-Vorabruf: N Dokument(e) in M Request(s)“ geschrieben.
 
 ## Module `knowledge/search.py`, `knowledge/graph.py`, `knowledge/mcp_server.py` (Agent „read“)
 
@@ -346,12 +407,14 @@ Routen (alle JSON, Fehler als `{"error": {"code": "...", "message": "..."}}`):
 | GET | `/api/settings` | `ConfigStore.get_public()` |
 | PUT | `/api/settings` | Patch → 200 neue public config; 400 bei ConfigError; 409 wenn Job läuft und Verbindungsdaten geändert werden sollen |
 | POST | `/api/settings/test` | `{"confluence": {...}, "jira": {...}}` via `test_connection()` mit aktueller Config (eigenes Budget 5 Requests, eigenes stop_event) |
+| GET | `/api/spaces?refresh=1` | `{"spaces": [{key,name,type,id,url}], "fetched_at", "cached"}` – alle sichtbaren Confluence-Spaces (Budget 400 Requests/300 s, 10 min In-Memory-Cache; `refresh=1` erzwingt neu laden, ein Fetch wird serialisiert (Single-Flight), Cache wird bei Änderungen an `confluence`/`http` verworfen). 400 ohne Basis-URL, 502 bei Upstream-Fehler, bei Fehler + Cache stattdessen stale Cache mit `"stale": true` und `"warning"` |
 | POST | `/api/jobs` | 202 `{"job_id","state"}`; 400 / 409 |
 | GET | `/api/jobs/current` | Status oder `{"job": null}`? → **immer** `{"job": status|null}` |
 | GET | `/api/jobs/{id}` | `{"job": status}`; 404 |
 | POST | `/api/jobs/{id}/stop` | `{"job": status}` |
 | GET | `/api/search?q=&type=&project=` | search.search |
 | GET | `/api/projects` | `{"projects": list_projects}` |
+| GET | `/api/top-documents?types=&limit=&offset=&project=&q=` | `graph.get_top_documents(...)` (Rang nach ein-/ausgehenden Kanten; `types` = `all`/`confluence`/`jira`, 400 bei ungültigem Typ/Limit) |
 | GET | `/api/documents/{uid}` | `{"document": get_document_detail}`; 404 (uid URL-decoded) |
 | GET | `/api/graph?center=&hops=&max_nodes=&types=&edge_kinds=a,b` | get_subgraph (hops ≤ graph.max_hops, max_nodes ≤ graph.max_visible_nodes) |
 | GET | `/api/stats` | db.get_stats |
@@ -365,10 +428,14 @@ Request-Body max 1 MB, nur `application/json`. Host-Header-Check gegen DNS-Rebin
 ## Frontend `web/index.html`, `web/style.css`, `web/app.js`, `web/graph.js` (Agent „frontend“)
 
 Vanilla JS, keine CDNs, keine Inline-Scripts/-Styles (CSP!), alles via `textContent`.
-Tabs: **Suche | Indexierung | Graph | Einstellungen**, Hash-Routing (`#search`, `#index`,
-`#graph?focus=jira:ENG-42`, `#settings`); `?focus=` als Query wird ebenfalls unterstützt.
+Tabs: **Suche | Indexierung | Graph | Top-Dokumente | Einstellungen**, Hash-Routing (`#search`,
+`#index`, `#graph?focus=jira:ENG-42`, `#top`, `#settings`); `?focus=` als Query wird ebenfalls unterstützt.
+Startseiten-Werte: Page-ID/`confluence:<id>`, Confluence-Seiten-URL, `space:KEY` oder eine
+Space-URL (`/display/KEY`, `/spaces/KEY`) – die Space-URL startet einen Space-Crawl (`space:KEY`).
 Einstellungen-Tab: Confluence (Basis-URL, API-Modus server/cloud_v2, Aliase, Sleep, Auth-Typ,
-Benutzername, Token-Passwortfeld mit „gesetzt“-Anzeige + „Token entfernen“), Jira (dito + Projekt-Keys),
+Auswahl der zu indexierenden Spaces + Änderungs-Indexierung „seit Datum“, siehe `/api/spaces`),
+Benutzername, Token-Passwortfeld mit „gesetzt“-Anzeige + „Token entfernen“),
+Jira (dito + Projekt-Keys),
 HTTP (Zertifikatsprüfung-Checkbox mit Hinweis „aus = für interne Zertifikate“, CA-Bundle,
 System-Proxy, max. Antwortgröße, User-Agent), Crawl-Standardwerte, Index-, Such-, Graph-Parameter,
 Server (Host/Port mit Hinweis „Neustart nötig“), Buttons „Speichern“ und „Verbindung testen“.

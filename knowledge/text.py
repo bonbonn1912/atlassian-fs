@@ -7,12 +7,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import html.parser
+import logging
 import re
 from typing import Any
 
 from knowledge.links import (
     LinkContext,
-    classify_url,
+    classify_document_url,
     find_plain_issue_keys,
     jira_issue_url,
     normalize_issue_key,
@@ -25,6 +26,8 @@ from knowledge.models import (
     jira_uid,
     unresolved_page_uid,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -265,7 +268,7 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
 
         if tag == "a":
             if self.current_a_href:
-                classified = classify_url(self.current_a_href, self.ctx)
+                classified = classify_document_url(self.current_a_href, self.ctx)
                 if classified:
                     uid, norm_url = classified
                     kind = edge_kind_for("confluence", uid)
@@ -369,8 +372,9 @@ def parse_confluence_storage(
     parser = _ConfluenceStorageHTMLParser(ctx, space_key=space_key)
     try:
         parser.feed(storage)
-    except Exception:
-        pass  # Never crash on malformed input
+    except Exception as exc:
+        # Never crash on malformed input, but do not hide the truncation either.
+        logger.warning("Confluence-Storage nur teilweise geparst (%s) – Rest übersprungen", exc)
     parser.finish()
 
     plain_text = _build_plain_text(parser.sections)
@@ -456,7 +460,7 @@ def adf_to_content(
                 if isinstance(mark, dict) and mark.get("type") == "link":
                     href = (mark.get("attrs") or {}).get("href")
                     if href:
-                        classified = classify_url(href, ctx)
+                        classified = classify_document_url(href, ctx)
                         if classified:
                             uid, norm_url = classified
                             kind = edge_kind_for(source_type, uid)
@@ -481,7 +485,7 @@ def adf_to_content(
             attrs = node.get("attrs") or {}
             url = attrs.get("url", "")
             if url:
-                classified = classify_url(url, ctx)
+                classified = classify_document_url(url, ctx)
                 if classified:
                     uid, norm_url = classified
                     kind = edge_kind_for(source_type, uid)
@@ -694,7 +698,7 @@ def jira_wiki_to_content(
             anchor = inner
             url = inner
 
-        classified = classify_url(url, ctx)
+        classified = classify_document_url(url, ctx)
         if classified:
             uid, norm_url = classified
             kind = edge_kind_for("jira", uid)
@@ -733,7 +737,7 @@ def jira_wiki_to_content(
     # Scan for bare URLs
     for m in re.finditer(r"https?://[^\s<>\[\]\"\'\(\)]+", raw):
         url = m.group(0).rstrip(".,;:!?")
-        classified = classify_url(url, ctx)
+        classified = classify_document_url(url, ctx)
         if classified:
             uid, norm_url = classified
             kind = edge_kind_for("jira", uid)

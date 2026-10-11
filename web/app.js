@@ -128,11 +128,13 @@
     graph: null,
     graphLoadedKey: null,
     settings: null,
+    spaces: null,        // /api/spaces
+    spacesFetchedAt: null,
   };
 
   // ------------------------------------------------------------------ routing
 
-  const TABS = ['search', 'index', 'graph', 'settings'];
+  const TABS = ['search', 'index', 'graph', 'top', 'settings'];
 
   function parseHash() {
     const raw = window.location.hash.replace(/^#/, '');
@@ -176,6 +178,7 @@
     if (tab === 'search') routeSearch(params);
     else if (tab === 'index') refreshIndexTab();
     else if (tab === 'graph') routeGraph(params);
+    else if (tab === 'top') routeTop(params);
     else if (tab === 'settings') loadSettings();
   }
 
@@ -301,17 +304,26 @@
   }
 
   async function loadProjects() {
-    const select = $('search-project-select');
+    const searchSelect = $('search-project-select');
+    const topSelect = $('top-project-select');
     try {
       const data = await api('GET', '/api/projects');
-      const current = select.value;
-      while (select.options.length > 1) select.remove(1);
+      const curSearch = searchSelect ? searchSelect.value : '';
+      const curTop = topSelect ? topSelect.value : '';
+      if (searchSelect) {
+        while (searchSelect.options.length > 1) searchSelect.remove(1);
+      }
+      if (topSelect) {
+        while (topSelect.options.length > 1) topSelect.remove(1);
+      }
       for (const p of data.projects || []) {
         if (!p.project) continue;
         const label = `${p.project} (${TYPE_LABEL[p.type] || p.type}, ${p.count})`;
-        select.appendChild(el('option', { text: label, attrs: { value: p.project } }));
+        if (searchSelect) searchSelect.appendChild(el('option', { text: label, attrs: { value: p.project } }));
+        if (topSelect) topSelect.appendChild(el('option', { text: label, attrs: { value: p.project } }));
       }
-      select.value = current;
+      if (searchSelect) searchSelect.value = curSearch;
+      if (topSelect) topSelect.value = curTop;
     } catch (err) {
       /* projects are optional */
     }
@@ -427,9 +439,11 @@
   // ------------------------------------------------------------------ indexing
 
   const JOB_FORM_FIELDS = [
-    'start_page', 'max_confluence_pages', 'max_jira_issues', 'max_total_documents', 'max_links_per_document',
+    'start_page', 'space_key', 'space_keys', 'modified_since',
+    'max_confluence_pages', 'max_jira_issues', 'max_total_documents', 'max_links_per_document',
     'max_api_requests', 'max_duration_minutes', 'max_confluence_depth', 'max_jira_link_hops',
     'confluence_sleep_seconds', 'jira_sleep_seconds', 'request_timeout_seconds', 'max_retries',
+    'batch_fetch_size',
     'include_child_pages', 'follow_confluence_links', 'index_linked_jira_issues', 'follow_jira_issue_links',
     'follow_jira_to_confluence', 'scan_plain_text_issue_keys', 'include_remote_links', 'resolve_page_titles',
     'refresh_existing',
@@ -447,14 +461,28 @@
       const lim = limits[name];
       if (input.type === 'checkbox') {
         input.checked = !!defaults[name];
+        // Ohne Jira-Basis-URL kann der Link-Follow nicht funktionieren und der
+        // Job-Start würde sonst an der Validierung scheitern.
+        if (name === 'index_linked_jira_issues' && !(state.config?.configured?.jira)) {
+          input.checked = false;
+        }
       } else {
+        if (name === 'space_keys') {
+          const value = Array.isArray(defaults[name]) ? defaults[name].join(', ') : (defaults[name] || '');
+          if (!input.value) input.value = value;
+          continue;
+        }
+        if (name === 'modified_since') {
+          if (!input.value) input.value = defaults[name] || '';
+          continue;
+        }
         if (lim && input.type === 'number') {
           if (lim.min !== undefined && lim.min !== null) input.min = lim.min;
           if (lim.max !== undefined && lim.max !== null) input.max = lim.max;
           input.step = lim.type === 'float' ? (input.step && input.step !== 'any' ? input.step : '0.1') : '1';
           input.required = true;
         }
-        if (defaults[name] !== undefined && defaults[name] !== null && (name !== 'start_page' || !input.value)) {
+        if (defaults[name] !== undefined && defaults[name] !== null && ((name !== 'start_page' && name !== 'space_key') || !input.value)) {
           input.value = defaults[name];
         }
       }
@@ -477,7 +505,20 @@
       const lim = limits[name] || {};
       const label = input.labels && input.labels[0] ? input.labels[0].textContent.replace('*', '').trim() : name;
       if (name === 'start_page') {
-        if (!raw && !allowMissingStartPage) errors.push('Bitte eine Confluence-Start-URL oder Page-ID angeben.');
+        payload[name] = raw;
+        continue;
+      }
+      if (name === 'space_key') {
+        payload[name] = raw.toUpperCase();
+        continue;
+      }
+      if (name === 'space_keys') {
+        // Schlüssel werden unverändert übernommen: Personal Spaces nutzen
+        // case-sensitive Keys wie "~jsmith".
+        payload[name] = raw.split(/[\s,;]+/).map((v) => v.trim()).filter(Boolean);
+        continue;
+      }
+      if (name === 'modified_since') {
         payload[name] = raw;
         continue;
       }
@@ -491,6 +532,12 @@
       }
       payload[name] = num;
     }
+    const hasSpaceSelection = Array.isArray(payload.space_keys) && payload.space_keys.length > 0;
+    if (!allowMissingStartPage && !payload.start_page && !payload.space_key
+        && !payload.modified_since && !hasSpaceSelection) {
+      errors.push('Bitte eine Confluence-Start-URL / Page-ID, einen Space-Key, '
+        + 'eine Space-Auswahl oder ein Änderungsdatum angeben.');
+    }
     return { payload, errors };
   }
 
@@ -503,6 +550,16 @@
       if (errors.length) {
         showFeedback(fb, errors.join(' · '), 'error');
         return;
+      }
+      // Eine explizit eingetragene Startseite/Space-Key gewinnt gegen die
+      // Modus-Felder aus den Standardwerten.
+      if (payload.start_page) {
+        payload.modified_since = '';
+        payload.space_keys = [];
+      } else if (payload.modified_since && payload.space_key && !payload.space_keys.length) {
+        // Ein einzelner Space-Key dient dem Änderungs-Modus als Filter.
+        payload.space_keys = [payload.space_key];
+        payload.space_key = '';
       }
       $('job-start-btn').disabled = true;
       try {
@@ -566,6 +623,10 @@
       const jiraSleep = crawl.jira_sleep_seconds;
       delete crawl.confluence_sleep_seconds;
       delete crawl.jira_sleep_seconds;
+      // Modus-Felder sind Einmal-Eingaben und dürfen nicht als Standard
+      // gespeichert werden – sonst verdrängen sie später die Startseite.
+      crawl.modified_since = '';
+      crawl.space_keys = [];
       try {
         await api('PUT', '/api/settings', {
           crawl_defaults: crawl,
@@ -676,6 +737,7 @@
     $('job-skipped').textContent = fmtNum(job.skipped || 0);
     $('job-errors').textContent = fmtNum(job.errors || 0);
     $('job-queue-size').textContent = fmtNum(job.queue_size ?? 0);
+    $('job-reused').textContent = fmtNum(job.reused_documents || 0);
     $('job-current-uid').textContent = job.current_uid || '—';
     $('job-last-message').textContent = job.last_message || '—';
 
@@ -800,6 +862,19 @@
       $('edge-filters-active-count').textContent = String(selectedEdgeKinds().length);
       reload();
     }));
+    const impBtn = $('graph-importance-btn');
+    if (impBtn) {
+      impBtn.addEventListener('click', () => {
+        const next = !state.graph.importanceMode;
+        state.graph.setImportanceMode(next);
+        impBtn.setAttribute('aria-pressed', next ? 'true' : 'false');
+        impBtn.classList.toggle('active', next);
+        impBtn.title = next
+          ? 'Wichtigkeits-Modus aktiv (zentriert wichtigste Knoten mit proportionaler Größe)'
+          : 'Knoten nach Wichtigkeit (eingehende Links) skalieren und zentral anordnen';
+      });
+    }
+
     $('graph-zoom-in').addEventListener('click', () => state.graph.zoomIn());
     $('graph-zoom-out').addEventListener('click', () => state.graph.zoomOut());
     $('graph-fit-btn').addEventListener('click', () => state.graph.fitToView());
@@ -844,6 +919,11 @@
       await new Promise((r) => requestAnimationFrame(r));
       $('graph-loading-overlay').hidden = true;
       state.graph.setData(data, data.center || null);
+      const impBtn = $('graph-importance-btn');
+      if (impBtn) {
+        impBtn.setAttribute('aria-pressed', state.graph.importanceMode ? 'true' : 'false');
+        impBtn.classList.toggle('active', state.graph.importanceMode);
+      }
       if (!data.nodes || !data.nodes.length) {
         showGraphBanner(focus ? 'Keine Knoten für diese Filter.' : 'Der Graph ist noch leer – zuerst eine Indexierung starten.');
       } else if (data.truncated) {
@@ -985,6 +1065,194 @@
     details.appendChild(actions);
   }
 
+
+  // ------------------------------------------------------------------ tab: top-dokumente
+
+  let topTabInitialized = false;
+
+  function initTopTabOnce() {
+    if (topTabInitialized) return;
+    topTabInitialized = true;
+
+    $('top-refresh-btn').addEventListener('click', () => loadTopDocuments());
+
+    ['top-type-all', 'top-type-confluence', 'top-type-jira'].forEach((id) => {
+      const elRadio = $(id);
+      if (elRadio) elRadio.addEventListener('change', () => onTopFiltersChanged());
+    });
+
+    $('top-project-select').addEventListener('change', () => onTopFiltersChanged());
+    $('top-limit-select').addEventListener('change', () => onTopFiltersChanged());
+
+    let searchDebounce = null;
+    $('top-search-input').addEventListener('input', () => {
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(() => onTopFiltersChanged(), 250);
+    });
+  }
+
+  function getTopFilters() {
+    let types = 'all';
+    if ($('top-type-confluence').checked) types = 'confluence';
+    else if ($('top-type-jira').checked) types = 'jira';
+
+    const project = $('top-project-select').value.trim();
+    const limit = parseInt($('top-limit-select').value, 10) || 50;
+    const q = $('top-search-input').value.trim();
+    return { types, project, limit, q };
+  }
+
+  function onTopFiltersChanged() {
+    const f = getTopFilters();
+    const p = {};
+    if (f.types !== 'all') p.types = f.types;
+    if (f.project) p.project = f.project;
+    if (f.limit !== 50) p.limit = String(f.limit);
+    if (f.q) p.q = f.q;
+    setHash('top', Object.keys(p).length ? p : null);
+  }
+
+  async function routeTop(params) {
+    initTopTabOnce();
+    const types = params.get('types') || 'all';
+    const project = params.get('project') || '';
+    const limit = params.get('limit') || '50';
+    const q = params.get('q') || '';
+
+    const r = $(`top-type-${types}`);
+    if (r) r.checked = true;
+
+    if (project && ![...$('top-project-select').options].some((o) => o.value === project)) {
+      $('top-project-select').appendChild(el('option', { text: project, attrs: { value: project } }));
+    }
+    $('top-project-select').value = project;
+    $('top-limit-select').value = limit;
+    $('top-search-input').value = q;
+
+    await loadTopDocuments();
+  }
+
+  async function loadTopDocuments() {
+    const { types, project, limit, q } = getTopFilters();
+    const qs = new URLSearchParams({ types, limit: String(limit), offset: '0' });
+    if (project) qs.set('project', project);
+    if (q) qs.set('q', q);
+
+    $('top-meta-text').textContent = 'Lade Top-Dokumente …';
+    const tbody = $('top-docs-tbody');
+    const emptyState = $('top-empty-state');
+    const table = $('top-docs-table');
+
+    try {
+      const res = await api('GET', `/api/top-documents?${qs}`);
+      const docs = res.documents || [];
+      const total = res.total || 0;
+
+      while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+
+      if (!docs.length) {
+        table.hidden = true;
+        emptyState.hidden = false;
+        $('top-meta-text').textContent = 'Keine Dokumente für diese Filterkriterien gefunden.';
+        return;
+      }
+
+      table.hidden = false;
+      emptyState.hidden = true;
+      $('top-meta-text').textContent = `${fmtNum(docs.length)} von ${fmtNum(total)} Dokumenten angezeigt (sortiert nach Anzahl eingehender Verlinkungen)`;
+
+      docs.forEach((doc, idx) => {
+        const rank = idx + 1;
+        const tr = document.createElement('tr');
+        tr.className = `top-doc-row top-rank-${rank <= 3 ? rank : 'other'}`;
+
+        // Rang
+        const tdRank = el('td', { className: 'td-rank' }, [
+          el('span', { className: `rank-badge rank-badge-${rank <= 3 ? rank : 'default'}`, text: `#${rank}` })
+        ]);
+
+        // Eingehende Links (Wichtigkeit)
+        const inBadge = el('span', {
+          className: 'incoming-count-badge',
+          attrs: { title: `${doc.incoming_count} Dokument(e) verlinken auf dieses Dokument` },
+          text: `${fmtNum(doc.incoming_count)} Links`
+        });
+        const tdInc = el('td', { className: 'td-incoming' }, [inBadge]);
+
+        // Titel & UID
+        const titleLink = el('a', {
+          className: 'top-doc-title-link',
+          text: doc.title || doc.uid,
+          attrs: { href: `#graph?focus=${encodeURIComponent(doc.uid)}`, title: 'Im Graph zentrieren' }
+        });
+        const uidSub = el('div', { className: 'top-doc-uid-sub', text: doc.uid });
+        const tdTitle = el('td', { className: 'td-title' }, [titleLink, uidSub]);
+
+        // Typ
+        const typeBadge = el('span', {
+          className: `type-pill type-pill-${doc.source_type}`,
+          text: doc.source_type === 'jira' ? 'Jira' : 'Confluence'
+        });
+        const tdType = el('td', { className: 'td-type' }, [typeBadge]);
+
+        // Space / Projekt
+        const tdSpace = el('td', { className: 'td-space', text: doc.space_or_project || '—' });
+
+        // Ausgehende Links
+        const tdOut = el('td', { className: 'td-outgoing', text: String(doc.outgoing_count || 0) });
+
+        // Status
+        const statusBadge = el('span', {
+          className: `status-tag status-${doc.state === 'indexed' ? 'indexed' : 'ref'}`,
+          text: doc.status_label || (doc.state === 'indexed' ? 'Indexiert' : doc.state)
+        });
+        const tdStatus = el('td', { className: 'td-status' }, [statusBadge]);
+
+        // Aktionen
+        const btnGraph = el('button', {
+          className: 'btn btn-secondary btn-xs action-graph-btn',
+          text: 'Graph',
+          attrs: { type: 'button', title: 'Dieses Dokument im Graph zentrieren' }
+        });
+        btnGraph.addEventListener('click', (e) => {
+          e.stopPropagation();
+          setHash('graph', { focus: doc.uid });
+        });
+
+        const actions = [btnGraph];
+        if (doc.url) {
+          const btnExt = el('a', {
+            className: 'btn btn-ghost btn-xs action-ext-link',
+            text: 'Öffnen ↗',
+            attrs: {
+              href: doc.url,
+              target: '_blank',
+              rel: 'noopener noreferrer',
+              title: 'Im Browser öffnen'
+            }
+          });
+          actions.push(btnExt);
+        }
+        const tdActions = el('td', { className: 'td-actions' }, actions);
+
+        tr.appendChild(tdRank);
+        tr.appendChild(tdInc);
+        tr.appendChild(tdTitle);
+        tr.appendChild(tdType);
+        tr.appendChild(tdSpace);
+        tr.appendChild(tdOut);
+        tr.appendChild(tdStatus);
+        tr.appendChild(tdActions);
+
+        tbody.appendChild(tr);
+      });
+    } catch (err) {
+      table.hidden = true;
+      emptyState.hidden = false;
+      $('top-meta-text').textContent = `Fehler beim Laden: ${err.message}`;
+    }
+  }
+
   // ------------------------------------------------------------------ settings
 
   // [elementId, section, key, kind]
@@ -1003,6 +1271,7 @@
     ['setting-http-use-system-proxy', 'http', 'use_system_proxy', 'bool'],
     ['setting-http-max-response-mb', 'http', 'max_response_mb', 'int'],
     ['setting-http-user-agent', 'http', 'user_agent', 'text'],
+    ['setting-crawl-batch-fetch-size', 'crawl_defaults', 'batch_fetch_size', 'int'],
     ['setting-index-chunk-target-chars', 'index', 'chunk_target_chars', 'int'],
     ['setting-index-chunk-overlap-chars', 'index', 'chunk_overlap_chars', 'int'],
     ['setting-index-min-chunk-chars', 'index', 'min_chunk_chars', 'int'],
@@ -1019,12 +1288,181 @@
   const SOURCES = ['confluence', 'jira'];
   const pendingTokenClear = { confluence: false, jira: false };
 
+  // Selected Confluence spaces (checkbox list in the settings tab)
+  let selectedSpaces = new Set();
+  let spacesAutoLoaded = false;
+
+  function isoDaysAgo(days) {
+    const d = new Date();
+    d.setDate(d.getDate() - Math.max(0, days));
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+
+  function setSpacesStatus(text, isError) {
+    const node = $('spaces-status');
+    if (!node) return;
+    node.textContent = text || '';
+    node.classList.toggle('is-error', !!isError);
+  }
+
+  function updateSpacesSelectionHint() {
+    const hint = $('spaces-selection-hint');
+    if (!hint) return;
+    const keys = [...selectedSpaces];
+    hint.textContent = keys.length
+      ? `${keys.length} Space(s) ausgewählt: ${keys.join(', ')}`
+      : 'Keine Spaces ausgewählt.';
+  }
+
+  function spacesFilterValue() {
+    const input = $('spaces-filter');
+    return input ? input.value.trim().toLowerCase() : '';
+  }
+
+  function spaceRow(space) {
+    // autocomplete=off: verhindert, dass der Browser beim Neuladen einen
+    // Checkbox-Zustand wiederherstellt, der nicht zur Auswahl im State passt.
+    const checkbox = el('input', { attrs: { type: 'checkbox', autocomplete: 'off' } });
+    checkbox.checked = selectedSpaces.has(space.key);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) selectedSpaces.add(space.key);
+      else selectedSpaces.delete(space.key);
+      updateSpacesSelectionHint();
+    });
+    const badges = [];
+    if (space.key) badges.push(el('span', { className: 'space-key', text: space.key }));
+    if (space.type) badges.push(el('span', { className: 'space-type', text: space.type }));
+    return el('label', { className: 'space-item' }, [
+      checkbox,
+      el('span', { className: 'space-name', text: space.name || space.key || '(ohne Namen)' }),
+      el('span', { className: 'space-badges' }, badges),
+    ]);
+  }
+
+  function renderSpacesList() {
+    const box = $('spaces-list');
+    if (!box) return;
+    clear(box);
+
+    const all = state.spaces || [];
+    const filter = spacesFilterValue();
+    const rows = all.filter((s) => !filter
+      || (s.name || '').toLowerCase().includes(filter)
+      || (s.key || '').toLowerCase().includes(filter));
+    // Bereits gespeicherte Keys, die die API nicht (mehr) liefert, bleiben
+    // abwählbar – z. B. archivierte oder nicht sichtbare Spaces.
+    const missing = [...selectedSpaces].filter((key) => !all.some((s) => s.key === key));
+
+    if (!all.length) {
+      box.appendChild(el('p', {
+        className: 'spaces-empty',
+        text: 'Noch keine Spaces geladen. „Spaces laden“ ruft die verfügbaren Spaces aus Confluence ab.',
+      }));
+    } else if (!rows.length && !missing.length) {
+      box.appendChild(el('p', { className: 'spaces-empty', text: 'Kein Space passt zum Filter.' }));
+    } else {
+      for (const space of rows) box.appendChild(spaceRow(space));
+    }
+    for (const key of missing) {
+      box.appendChild(spaceRow({ key, name: key, type: 'nicht in Liste' }));
+    }
+    updateSpacesSelectionHint();
+  }
+
+  async function loadSpaces(force) {
+    const btn = $('spaces-load-btn');
+    if (btn) btn.disabled = true;
+    setSpacesStatus('Lade Spaces aus Confluence …');
+    try {
+      const data = await api('GET', `/api/spaces${force ? '?refresh=1' : ''}`);
+      state.spaces = Array.isArray(data.spaces) ? data.spaces : [];
+      state.spacesFetchedAt = data.fetched_at || null;
+      let status = `${state.spaces.length} Space(s) geladen`;
+      if (state.spacesFetchedAt) status += ` · Stand: ${formatDate(state.spacesFetchedAt)}`;
+      setSpacesStatus(data.warning ? `${status} · ${data.warning}` : status, !!data.warning);
+      renderSpacesList();
+    } catch (err) {
+      setSpacesStatus(`Spaces konnten nicht geladen werden: ${err.message}`, true);
+      const box = $('spaces-list');
+      if (box && !state.spaces) {
+        clear(box);
+        box.appendChild(el('p', { className: 'spaces-empty', text: err.message }));
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function startSettingsJob(mode) {
+    const fb = $('settings-feedback');
+    const { payload, errors } = collectJobForm({ allowMissingStartPage: true });
+    const realErrors = errors.filter((m) => !m.startsWith('Bitte eine Confluence'));
+    if (realErrors.length) {
+      showFeedback(fb, realErrors.join(' · '), 'error');
+      return;
+    }
+
+    const selected = [...selectedSpaces];
+    if (mode === 'spaces') {
+      if (!selected.length) {
+        showFeedback(fb, 'Bitte mindestens einen Space auswählen.', 'error');
+        return;
+      }
+      payload.space_keys = selected;
+      payload.modified_since = '';
+    } else {
+      const dateInput = $('setting-modified-since');
+      const since = dateInput ? dateInput.value.trim() : '';
+      if (!since) {
+        showFeedback(fb, 'Bitte ein Datum unter „Geänderte Seiten seit“ angeben.', 'error');
+        return;
+      }
+      payload.modified_since = since;
+      const onlySelected = $('setting-modified-scope-selected').checked;
+      payload.space_keys = onlySelected ? selected : [];
+    }
+    payload.start_page = '';
+    payload.space_key = '';
+    // Reine Confluence-Läufe: ohne Jira-Basis-URL sind die Jira-Optionen nicht nutzbar.
+    const jiraConfigured = !!(state.config && state.config.configured && state.config.configured.jira);
+    if (!jiraConfigured) payload.index_linked_jira_issues = false;
+
+    const btns = [$('spaces-index-btn'), $('modified-index-btn')];
+    btns.forEach((b) => { if (b) b.disabled = true; });
+    try {
+      const res = await api('POST', '/api/jobs', payload);
+      showFeedback(fb, `Job #${res.job_id} gestartet – Fortschritt im Tab „Indexierung“.`, 'success');
+      setHash('index');
+      pollJob();
+    } catch (err) {
+      showFeedback(fb, err.message, 'error');
+    } finally {
+      btns.forEach((b) => { if (b) b.disabled = false; });
+    }
+  }
+
   function initSettings() {
     $('settings-form').addEventListener('submit', (e) => { e.preventDefault(); saveSettings(); });
     $('settings-save-btn').addEventListener('click', saveSettings);
     $('settings-test-btn').addEventListener('click', testConnection);
     $('settings-test-btn-bottom').addEventListener('click', testConnection);
     $('setting-http-verify-ssl').addEventListener('change', syncSslFields);
+    $('spaces-load-btn').addEventListener('click', () => loadSpaces(true));
+    $('spaces-filter').addEventListener('input', renderSpacesList);
+    $('spaces-filter').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') e.preventDefault();  // Filter-Enter darf nicht speichern
+    });
+    $('spaces-select-all').addEventListener('click', () => {
+      for (const space of state.spaces || []) selectedSpaces.add(space.key);
+      renderSpacesList();
+    });
+    $('spaces-select-none').addEventListener('click', () => {
+      selectedSpaces.clear();
+      renderSpacesList();
+    });
+    $('spaces-index-btn').addEventListener('click', () => startSettingsJob('spaces'));
+    $('modified-index-btn').addEventListener('click', () => startSettingsJob('modified'));
     for (const src of SOURCES) {
       $(`setting-${src}-auth-type`).addEventListener('change', () => syncAuthFields(src));
       $(`setting-${src}-token-clear`).addEventListener('click', () => {
@@ -1059,6 +1497,11 @@
       return;
     }
     state.settings = s;
+    selectedSpaces = new Set(
+      (s.confluence && Array.isArray(s.confluence.selected_spaces))
+        ? s.confluence.selected_spaces
+        : [],
+    );
     for (const [id, section, key, kind] of SETTINGS_FIELDS) {
       const input = $(id);
       const value = s[section] ? s[section][key] : undefined;
@@ -1082,6 +1525,13 @@
       syncAuthFields(src);
     }
     syncSslFields();
+    const sinceInput = $('setting-modified-since');
+    if (sinceInput && !sinceInput.value) sinceInput.value = isoDaysAgo(7);
+    renderSpacesList();
+    if (!spacesAutoLoaded) {
+      spacesAutoLoaded = true;
+      loadSpaces(false);
+    }
   }
 
   function collectSettings() {
@@ -1106,6 +1556,7 @@
       } else value = input.value.trim();
       (patch[section] = patch[section] || {})[key] = value;
     }
+    (patch.confluence = patch.confluence || {}).selected_spaces = [...selectedSpaces];
     for (const src of SOURCES) {
       const auth = { type: $(`setting-${src}-auth-type`).value, username: $(`setting-${src}-username`).value.trim() };
       const token = $(`setting-${src}-token`).value;

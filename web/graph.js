@@ -15,6 +15,8 @@
   const MAX_ZOOM = 8;
   const LABEL_FONT_PX = 12;
   const MAX_LABELS = 700;
+  const MIN_IMPORTANCE_RADIUS = 7;
+  const MAX_IMPORTANCE_RADIUS = 35;
   const ERROR_STATES = new Set(['missing', 'forbidden', 'error']);
 
   const EDGE_STYLES = {
@@ -66,6 +68,7 @@
       this.selectedEdgeId = null;
       this.highlight = null;          // Set of uids highlighted by selection
       this.hoverNode = null;
+      this.importanceMode = false;
 
       this.k = 1; this.tx = 0; this.ty = 0;
       this.width = 0; this.height = 0; this.dpr = 1;
@@ -118,6 +121,35 @@
       return isCenter ? base + 5 : base;
     }
 
+    _computeRadii() {
+      if (!this.nodes.length) return;
+      if (!this.importanceMode) {
+        for (const node of this.nodes) {
+          node.r = KnowledgeGraph.radiusFor(node, node.uid === this.centerUid);
+        }
+        return;
+      }
+      let minImp = Infinity, maxImp = -Infinity;
+      for (const node of this.nodes) {
+        const imp = node.in_degree ?? 0;
+        if (imp < minImp) minImp = imp;
+        if (imp > maxImp) maxImp = imp;
+      }
+      if (!isFinite(minImp)) { minImp = 0; maxImp = 0; }
+      const span = maxImp - minImp;
+      for (const node of this.nodes) {
+        const imp = node.in_degree ?? 0;
+        const ratio = span > 0 ? (imp - minImp) / span : 0.5;
+        node.r = Math.round((MIN_IMPORTANCE_RADIUS + ratio * (MAX_IMPORTANCE_RADIUS - MIN_IMPORTANCE_RADIUS)) * 10) / 10;
+      }
+    }
+
+    setImportanceMode(enabled) {
+      this.importanceMode = Boolean(enabled);
+      this._computeRadii();
+      this._startLayout();
+    }
+
     setData(data, centerUid) {
       this.centerUid = centerUid || data.center || null;
       this.selectedUid = null;
@@ -131,11 +163,11 @@
       this.nodeMap.clear();
       this.nodes = (data.nodes || []).map((n, idx) => {
         const node = { ...n, idx, x: 0, y: 0 };
-        node.r = KnowledgeGraph.radiusFor(node, node.uid === this.centerUid);
         node.label = truncate(node.title || node.uid, 34);
         this.nodeMap.set(node.uid, node);
         return node;
       });
+      this._computeRadii();
       this.edgeMap.clear();
       this.edges = [];
       for (const e of data.edges || []) {
@@ -169,14 +201,18 @@
         return;
       }
       const radii = new Float32Array(n);
-      this.nodes.forEach((node) => { radii[node.idx] = node.r; });
+      const importance = new Float32Array(n);
+      this.nodes.forEach((node) => {
+        radii[node.idx] = node.r;
+        importance[node.idx] = node.in_degree ?? 0;
+      });
       const links = new Uint32Array(this.edges.length * 2);
       this.edges.forEach((e, k) => { links[2 * k] = e.s.idx; links[2 * k + 1] = e.t.idx; });
 
       const id = ++this.layoutId;
       this.layoutDone = false;
       this.onLayoutProgress(0, false);
-      const msg = { id, count: n, radii, links, center };
+      const msg = { id, count: n, radii, links, center, importanceMode: this.importanceMode, importance };
       const handle = (m) => {
         if (m.id !== id || id !== this.layoutId) return;
         if (m.type === 'error') {
@@ -205,6 +241,7 @@
         worker.terminate();
         if (this.worker === worker) this.worker = null;
         this._mainThreadLayout({ ...msg, radii: Float32Array.from(this.nodes.map((nd) => nd.r)),
+                                 importance: Float32Array.from(this.nodes.map((nd) => nd.in_degree ?? 0)),
                                  links: Uint32Array.from(this.edges.flatMap((e) => [e.s.idx, e.t.idx])) }, handle);
       }, 2000);
       worker.onmessage = (ev) => {
@@ -222,6 +259,7 @@
         if (heardBack) { this._gridLayout(); return; }
         heardBack = true;
         this._mainThreadLayout({ ...msg, radii: Float32Array.from(this.nodes.map((nd) => nd.r)),
+                                 importance: Float32Array.from(this.nodes.map((nd) => nd.in_degree ?? 0)),
                                  links: Uint32Array.from(this.edges.flatMap((e) => [e.s.idx, e.t.idx])) }, handle);
       };
       // Copies are sent so the main-thread fallback could still use the originals.
@@ -539,7 +577,8 @@
       const meta = document.createElement('div');
       meta.className = 'graph-tooltip-meta';
       const typeLabel = node.type === 'jira' ? 'Jira' : 'Confluence';
-      const parts = [node.uid, typeLabel, node.document_type, node.status, node.state !== 'indexed' ? node.state : null];
+      const inDeg = node.in_degree !== undefined ? String(node.in_degree) + " eingehende Links" : null;
+      const parts = [node.uid, typeLabel, node.document_type, node.status, inDeg, node.state !== 'indexed' ? node.state : null];
       meta.textContent = parts.filter(Boolean).join(' · ');
       tip.appendChild(title);
       tip.appendChild(meta);

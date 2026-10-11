@@ -60,6 +60,80 @@ class TestText(unittest.TestCase):
 
     # --- Confluence Storage Format Tests ---
 
+    def test_table_cells_keep_paragraphs_breaks_links_and_literal_pipes(self) -> None:
+        parsed = parse_confluence_storage('''<h2>Details</h2><table>
+            <tr><th><p>Name</p></th><th><p>Value</p></th></tr>
+            <tr><td><p>First</p><p>Second<br/>Third</p></td>
+            <td><p>A | B</p><a href="https://jira.intern/browse/PROJ-42">Issue</a></td></tr>
+            <tr><td></td><td>Last</td></tr></table><p>After</p>''', self.ctx)
+        self.assertEqual(parsed.sections[0][0], 'Details')
+        self.assertIn('| Name | Value |\n| --- | --- |\n'
+                      '| First / Second / Third | A \\| B / Issue |\n| | Last |', parsed.plain_text)
+        self.assertTrue(parsed.plain_text.endswith('After'))
+        self.assertIn('jira:PROJ-42', {link.uid for link in parsed.links})
+
+    def test_table_spans_and_multiple_header_rows(self) -> None:
+        parsed = parse_confluence_storage('''<table>
+            <tr><th rowspan="2">Service</th><th colspan="2">Limits</th></tr>
+            <tr><th>Min</th><th>Max</th></tr>
+            <tr><td rowspan="2">API</td><td>1</td><td>10</td></tr>
+            <tr><td colspan="2">Unlimited</td></tr></table>''', self.ctx)
+        self.assertEqual(parsed.plain_text, '| Service | Limits / Min | Limits / Max |\n'
+                         '| --- | --- | --- |\n| API | 1 | 10 |\n| API | Unlimited | Unlimited |')
+
+    def test_nested_table_and_heading_stay_inside_cell(self) -> None:
+        parsed = parse_confluence_storage('''<h2>Outer</h2><table>
+            <tr><th>Name</th><th>Details</th></tr><tr><td>API</td><td>
+            <h3>Nested heading</h3><table><tr><th>Port</th></tr><tr><td>8080</td></tr></table>
+            <p>After nested</p></td></tr></table><h2>Next</h2><p>Done</p>''', self.ctx)
+        self.assertEqual([heading for heading, _ in parsed.sections], ['Outer', 'Next'])
+        self.assertIn('| API | Nested heading / Port: 8080 / After nested |', parsed.plain_text)
+
+    def test_table_without_headers_keeps_first_row_and_incomplete_markup(self) -> None:
+        parsed = parse_confluence_storage('<table><tr><td>first</td><td>second</td></tr>'
+                                         '<tr><td>third</td><td>fourth', self.ctx)
+        self.assertEqual(parsed.plain_text, '| Spalte 1 | Spalte 2 |\n| --- | --- |\n'
+                         '| first | second |\n| third | fourth |')
+
+    def test_jira_table_preserves_empty_columns_and_escaped_pipes(self) -> None:
+        parsed = jira_wiki_to_content('||A||B||C||\n|one||three|\n|four|a\\|b|six|', self.ctx)
+        self.assertEqual(parsed.plain_text, '| A | B | C |\n| --- | --- | --- |\n'
+                         '| one | | three |\n| four | a\\|b | six |')
+
+    def test_adf_table_preserves_spans_and_empty_cells(self) -> None:
+        def cell(text, header=False, **attrs):
+            return {'type': 'tableHeader' if header else 'tableCell', 'attrs': attrs,
+                    'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': text}]}]}
+        table = {'type': 'table', 'content': [
+            {'type': 'tableRow', 'content': [cell('A', True), cell('B', True), cell('C', True)]},
+            {'type': 'tableRow', 'content': [cell('both', colspan=2), cell('')]},
+        ]}
+        table['content'][1]['content'][0]['content'].append(
+            {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'next paragraph'}]})
+        parsed = adf_to_content({'type': 'doc', 'content': [table]}, self.ctx)
+        self.assertEqual(parsed.plain_text, '| A | B | C |\n| --- | --- | --- |\n'
+                         '| both / next paragraph | both / next paragraph | |')
+
+    def test_table_chunks_repeat_headers_and_preserve_entire_rows(self) -> None:
+        rows = [f'| item {i} | ' + 'description ' * 10 + '|' for i in range(8)]
+        header = '| Name | Value |\n| --- | --- |'
+        chunks = chunk_sections('Title', [('Details', header + '\n' + '\n'.join(rows))],
+                                target_chars=250, overlap_chars=30, min_chars=20)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertEqual(chunk.heading, 'Details')
+            self.assertTrue(chunk.body.startswith(header + '\n'))
+        for row in rows:
+            self.assertEqual(sum(row in chunk.body.splitlines() for chunk in chunks), 1)
+
+    def test_oversize_table_row_is_not_split_and_small_intro_stays_separate(self) -> None:
+        row = '| item | ' + 'long cell ' * 100 + '|'
+        parsed = [('Details', 'Intro\n\n| Name | Value |\n| --- | --- |\n' + row)]
+        chunks = chunk_sections('Title', parsed, target_chars=200, min_chars=80)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn('Intro\n\n| Name | Value |\n', chunks[0].body)
+        self.assertIn(row, chunks[0].body.splitlines())
+
     def test_confluence_storage_fixture(self) -> None:
         fixture_path = FIXTURES_DIR / "confluence_storage_server.html"
         storage = fixture_path.read_text(encoding="utf-8")

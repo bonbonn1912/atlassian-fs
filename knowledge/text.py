@@ -11,6 +11,8 @@ import logging
 import re
 from typing import Any
 
+from knowledge.tables import StorageTable, TableCell, render_table, table_span
+
 from knowledge.links import (
     LinkContext,
     classify_document_url,
@@ -110,6 +112,8 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
         self.current_a_href: str | None = None
         self.current_a_text: list[str] = []
 
+        self.table_stack: list[StorageTable] = []
+
         self.links: list[LinkTarget] = []
         self.seen_links: set[tuple[str, str]] = set()
 
@@ -122,6 +126,24 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
             self.ignore_depth += 1
             return
         if self.ignore_depth > 0:
+            return
+
+        if tag == "table":
+            self.table_stack.append(StorageTable())
+            return
+        if self.table_stack:
+            table = self.table_stack[-1]
+            if tag == "tr":
+                table.start_row()
+                return
+            if tag in ("td", "th"):
+                table.start_cell(tag == "th", attr_dict)
+                return
+            if re.fullmatch(r"h[1-6]", tag):
+                self._append("\n")
+                return
+        if tag == "br":
+            self._append("\n")
             return
 
         # Headings h1..h6
@@ -176,8 +198,8 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
             return
 
         # Block-level tags produce spacing
-        if tag in ("p", "div", "li", "tr", "blockquote", "pre", "table", "ul", "ol"):
-            self.buf.append("\n")
+        if tag in ("p", "div", "li", "blockquote", "pre", "ul", "ol"):
+            self._append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         if tag in ("script", "style"):
@@ -186,6 +208,22 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
             return
         if self.ignore_depth > 0:
             return
+
+        if self.table_stack:
+            table = self.table_stack[-1]
+            if tag in ("td", "th"):
+                table.end_cell()
+                return
+            if tag == "tr":
+                table.end_row()
+                return
+            if tag == "table":
+                self.table_stack.pop()
+                self._append("\n\n" + table.render(nested=bool(self.table_stack)) + "\n\n")
+                return
+            if re.fullmatch(r"h[1-6]", tag):
+                self._append("\n")
+                return
 
         if tag.startswith("h") and len(tag) == 2 and tag[1] in "123456":
             self.in_heading = False
@@ -218,7 +256,7 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
                             evidence_url=ev_url,
                             title_hint=norm_k,
                         )
-                        self.buf.append(f" {norm_k} ")
+                        self._append(f" {norm_k} ")
             self.in_macro = False
             self.macro_name = ""
             self.macro_params = {}
@@ -259,7 +297,7 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
 
             # If no link body was present, emit title to readable text
             if not body_txt and title:
-                self.buf.append(f" {title} ")
+                self._append(f" {title} ")
 
             self.in_ac_link = False
             self.ac_link_target = {}
@@ -286,13 +324,7 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
             return
 
         if tag in ("p", "div", "li", "blockquote", "pre"):
-            self.buf.append("\n")
-        elif tag == "br":
-            self.buf.append("\n")
-        elif tag in ("td", "th"):
-            self.buf.append(" | ")
-        elif tag == "tr":
-            self.buf.append("\n")
+            self._append("\n")
 
     def handle_data(self, data: str) -> None:
         if self.ignore_depth > 0:
@@ -313,13 +345,19 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
         if self.in_link_body:
             self.link_body_buf.append(data)
 
-        self.buf.append(data)
+        self._append(data)
 
     def unknown_decl(self, data: str) -> None:
         # Handle CDATA in <ac:plain-text-body> etc.
         if data.upper().startswith("CDATA["):
             content = data[6:]
             self.handle_data(content)
+
+    def _append(self, value: str) -> None:
+        if self.table_stack:
+            self.table_stack[-1].append(value)
+        else:
+            self.buf.append(value)
 
     def _flush_section(self) -> None:
         text = _clean_text("".join(self.buf))
@@ -353,6 +391,10 @@ class _ConfluenceStorageHTMLParser(html.parser.HTMLParser):
             )
 
     def finish(self) -> None:
+        # Preserve collected cells even when upstream markup omitted closing tags.
+        while self.table_stack:
+            table = self.table_stack.pop()
+            self._append("\n\n" + table.render(nested=bool(self.table_stack)) + "\n\n")
         self._flush_section()
         if not self.sections:
             self.sections.append(("", ""))
@@ -508,6 +550,8 @@ def adf_to_content(
         children = node.get("content") or []
         if isinstance(children, list):
             sep = "" if ntype in ("paragraph", "heading", "codeBlock") else " "
+            if ntype in ("tableCell", "tableHeader"):
+                sep = "\n"
             return sep.join(t for t in (_extract_inline(c) for c in children) if t)
 
         return ""
@@ -566,19 +610,20 @@ def adf_to_content(
             return
 
         if btype == "table":
-            rows = block.get("content") or []
-            if isinstance(rows, list):
-                for row in rows:
-                    if isinstance(row, dict) and row.get("type") == "tableRow":
-                        cells = row.get("content") or []
-                        cell_texts = []
-                        if isinstance(cells, list):
-                            for cell in cells:
-                                if isinstance(cell, dict):
-                                    c_text = " ".join(_extract_inline(cell).split())
-                                    cell_texts.append(c_text)
-                        if cell_texts:
-                            current_lines.append(" | ".join(cell_texts))
+            rows = []
+            for row in block.get("content") or []:
+                if not isinstance(row, dict) or row.get("type") != "tableRow":
+                    continue
+                cells = []
+                for cell in row.get("content") or []:
+                    if not isinstance(cell, dict):
+                        continue
+                    attrs = cell.get("attrs") or {}
+                    cells.append(TableCell(_extract_inline(cell), cell.get("type") == "tableHeader",
+                                           table_span(attrs.get("colspan", 1)),
+                                           table_span(attrs.get("rowspan", 1))))
+                rows.append(cells)
+            current_lines.append("\n" + render_table(rows) + "\n")
             return
 
         if btype in ("inlineCard", "blockCard", "embedCard"):
@@ -761,10 +806,18 @@ def jira_wiki_to_content(
     curr_heading = ""
     curr_lines: list[str] = []
 
+    table_rows: list[list[TableCell]] = []
+
+    def flush_table() -> None:
+        if table_rows:
+            curr_lines.append("\n" + render_table(table_rows) + "\n")
+            table_rows.clear()
+
     for line in raw.splitlines():
         line_s = line.strip()
         hm = re.match(r"^h[1-6]\.\s*(.*)$", line_s)
         if hm:
+            flush_table()
             stext = _clean_text("\n".join(curr_lines))
             if curr_heading or stext:
                 sections.append((curr_heading, stext))
@@ -772,18 +825,19 @@ def jira_wiki_to_content(
             curr_lines = []
             continue
 
-        # Tables: ||Header||Header|| or |Cell|Cell|
-        if line_s.startswith("||") and line_s.endswith("||"):
-            cells = [c.strip() for c in line_s.strip("|").split("||")]
-            curr_lines.append(" | ".join(c for c in cells if c))
+        # Keep empty cells in their original columns, including at row edges.
+        if line_s.startswith("|") and line_s.endswith("|"):
+            header = line_s.startswith("||") and line_s.endswith("||")
+            edge = 2 if header else 1
+            separator = r"(?<!\\)\|\|" if header else r"(?<!\\)\|"
+            cells = re.split(separator, line_s[edge:-edge])
+            table_rows.append([TableCell(c.strip().replace(r"\|", "|"), header) for c in cells])
             continue
-        elif line_s.startswith("|") and line_s.endswith("|"):
-            cells = [c.strip() for c in line_s.strip("|").split("|")]
-            curr_lines.append(" | ".join(c for c in cells if c))
-            continue
+        flush_table()
 
         curr_lines.append(line)
 
+    flush_table()
     stext = _clean_text("\n".join(curr_lines))
     if curr_heading or stext or not sections:
         sections.append((curr_heading, stext))
@@ -896,6 +950,46 @@ def _split_section_text(
     return chunks
 
 
+_TABLE_DIVIDER = re.compile(r"^\|(?:\s*:?-+:?\s*\|)+$")
+
+
+def _split_structured_section(text: str, **options: int) -> list[str]:
+    lines = text.splitlines()
+    pieces: list[str] = []
+    prose: list[str] = []
+    target = options["target_chars"]
+
+    def flush_prose() -> None:
+        if prose:
+            pieces.extend(_split_section_text("\n".join(prose), **options))
+            prose.clear()
+
+    i = 0
+    while i < len(lines):
+        if (i + 1 < len(lines) and lines[i].startswith("| ")
+                and _TABLE_DIVIDER.fullmatch(lines[i + 1])):
+            flush_prose()
+            header = [lines[i], lines[i + 1]]
+            group = list(header)
+            size = len("\n".join(group))
+            i += 2
+            while i < len(lines) and lines[i].startswith("| ") and lines[i].endswith(" |"):
+                row = lines[i]
+                if len(group) > 2 and size + len(row) + 1 > target:
+                    pieces.append("\n".join(group))
+                    group = list(header)
+                    size = len("\n".join(group))
+                group.append(row)
+                size += len(row) + 1
+                i += 1
+            pieces.append("\n".join(group))
+        else:
+            prose.append(lines[i])
+            i += 1
+    flush_prose()
+    return pieces
+
+
 def chunk_sections(
     title: str,
     sections: list[tuple[str, str]],
@@ -912,7 +1006,7 @@ def chunk_sections(
         if not clean_t:
             continue
 
-        sub_bodies = _split_section_text(
+        sub_bodies = _split_structured_section(
             clean_t,
             target_chars=target_chars,
             overlap_chars=overlap_chars,
@@ -950,7 +1044,7 @@ def chunk_sections(
                 )
                 merged[-1] = Chunk(
                     heading=c.heading or prev.heading,
-                    body=(extra + c.body).strip(),
+                    body=(extra.rstrip() + "\n\n" + c.body).strip(),
                 )
             else:
                 merged.append(c)

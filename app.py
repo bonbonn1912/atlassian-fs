@@ -17,7 +17,7 @@ if sys.version_info < (3, 10):
     sys.exit(1)
 
 from knowledge import db
-from knowledge.config import ConfigStore, resolve_db_path
+from knowledge.config import ConfigStore, load_config, resolve_db_path
 
 
 def setup_logging() -> None:
@@ -116,7 +116,9 @@ def cmd_mcp(args: argparse.Namespace) -> None:
         sys.stderr.write(f"Fehler beim Laden des MCP-Servers: {exc}\n")
         sys.exit(1)
 
-    mcp_server.run_stdio(db_path, cfg)
+    # The UI and stdio MCP run in different processes. Read persisted output
+    # settings on each document request so saving in the UI takes effect live.
+    mcp_server.run_stdio(db_path, cfg, config_loader=lambda: load_config(config_store.path))
 
 
 def cmd_serve(args: argparse.Namespace) -> None:

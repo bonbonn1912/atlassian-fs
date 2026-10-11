@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from knowledge import db, models, search
+from knowledge.config import ConfigStore, load_config
 from knowledge.mcp_server import McpServer, run_stdio
 
 
@@ -168,6 +169,44 @@ class TestMcpServer(unittest.TestCase):
         self.assertEqual(doc["uid"], "confluence:101")
         self.assertTrue(doc["truncated"])
         self.assertEqual(len(doc["text"]), 150)
+
+    def test_live_output_settings_default_cap_and_large_request(self) -> None:
+        self.conn.execute("UPDATE documents SET body_text=? WHERE uid='confluence:101'", ('ä' * 100000,))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            settings = ConfigStore(path)
+            settings.update({'mcp': {'default_max_chars': 300, 'max_output_chars': 60000}})
+            server = McpServer(self.conn, config_loader=lambda: load_config(path))
+
+            def get(**args):
+                response = server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                          'params': {'name': 'get_document',
+                                                     'arguments': {'uid': 'confluence:101', **args}}})
+                self.assertFalse(response['result']['isError'])
+                return response['result']['structuredContent']
+
+            self.assertEqual(len(get()['text']), 300)
+            capped = get(max_chars=100000)
+            self.assertEqual(capped['returned_chars'], 60000)
+            self.assertEqual(capped['max_chars'], 60000)
+            self.assertEqual(capped['total_chars'], 100000)
+            self.assertTrue(capped['truncated'])
+            # UI saves in another process; the already-running MCP must reload.
+            settings.update({'mcp': {'default_max_chars': 80000, 'max_output_chars': 100000}})
+            self.assertEqual(len(get()['text']), 80000)
+            self.assertFalse(get(max_chars=100000)['truncated'])
+            path.write_text('{broken', encoding='utf-8')
+            result = server.handle({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                                    'params': {'name': 'get_document', 'arguments': {'uid': 'confluence:101'}}})
+            self.assertTrue(result['result']['isError'])
+
+    def test_document_output_rejects_non_integer_and_out_of_range(self) -> None:
+        for value in (True, False, 100.5, '1000', 99, 2000001):
+            with self.subTest(value=value):
+                result = self.server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                             'params': {'name': 'get_document',
+                                                        'arguments': {'uid': 'confluence:101', 'max_chars': value}}})
+                self.assertTrue(result['result']['isError'])
 
     def test_tool_call_unknown_uid_is_error(self) -> None:
         for tool_name, args in [

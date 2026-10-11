@@ -37,6 +37,7 @@ konkreten Python-Schnittstellen. Alle Module halten sich exakt daran.
 cfg["confluence"] = {base_url, api_mode, sleep_seconds, aliases, selected_spaces, auth:{type,username,token}}
 cfg["jira"]       = {base_url, api_mode, sleep_seconds, aliases, project_keys, auth:{...}}
 cfg["http"]       = {verify_ssl, ca_bundle, use_system_proxy, max_response_mb, user_agent}
+cfg["mcp"]        = {default_max_chars: 20000, max_output_chars: 500000}
 cfg["crawl_defaults"], cfg["index"], cfg["search"], cfg["graph"], cfg["server"], cfg["database"]
 ```
 
@@ -393,8 +394,21 @@ def get_neighbors(conn, uid, *, direction: str = "both", limit: int = 50) -> dic
 def find_related(conn, uid, *, limit: int = 10) -> dict | None
     # direct neighbours + documents sharing >=1 direct neighbour (score = shared count), excl. self
 ```
-MCP (`knowledge/mcp_server.py`): `def run_stdio(db_path, cfg, stdin=sys.stdin, stdout=sys.stdout) -> None`
-und `class McpServer(db_path, cfg)` mit `handle(message: dict) -> dict | None`.
+MCP (`knowledge/mcp_server.py`): `def run_stdio(db_path, cfg, stdin=sys.stdin, stdout=sys.stdout, *, config_loader=None) -> None`
+und `class McpServer(db_path, cfg, *, config_loader=None)` mit `handle(message: dict) -> dict | None`.
+Der optionale Loader liefert die aktuelle Konfiguration bei jedem Dokumentabruf;
+`app.py mcp` liest dafür die mit der UI geteilte Konfigurationsdatei erneut ein.
+`mcp.default_max_chars` und `mcp.max_output_chars` sind per UI konfigurierbare Ganzzahlen
+von 100 bis 2.000.000 (Standard ≤ Maximum). `get_document.max_chars` wird auf das
+konfigurierte Maximum begrenzt; die Antwort enthält das wirksame `max_chars` sowie
+`total_chars`, `returned_chars` und `truncated`. Die Grenze gilt für den Dokumenttext.
+
+Tabellenaufbereitung (`knowledge/tables.py`): Confluence-Storage und Jira-ADF verwenden
+`TableCell` und `render_table`; Jira-Wiki erhält dieselbe Markdown-Darstellung mit
+erhaltenen leeren Zellen. Verbundene Zellen werden expandiert (Spans defensiv auf
+1–100 begrenzt), mehrzeilige Tabellenköpfe kombiniert, verschachtelte Storage-Tabellen
+als beschrifteter Zelltext dargestellt. Tabellen-Chunks wiederholen den Tabellenkopf
+und trennen nur zwischen Zeilen; einzelne übergroße Zeilen bleiben zusammen.
 Protokoll: JSON-RPC 2.0, eine Nachricht pro Zeile, unterstützte Protokollversionen
 `["2025-06-18", "2025-03-26", "2024-11-05"]` (Client-Version übernehmen falls unterstützt, sonst
 neueste). `initialize` → `{protocolVersion, capabilities:{tools:{listChanged:false}},

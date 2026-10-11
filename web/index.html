@@ -926,6 +926,25 @@
 
             <!-- Such- und Graphparameter -->
             <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">MCP-Dokumentausgabe</legend>
+              <p class="field-hint" id="mcp-output-help">Legt die Textmenge pro Dokumentabruf durch einen KI-Assistenten fest.
+                Änderungen gelten ab dem nächsten Abruf. Größere Antworten benötigen mehr Kontext und Tokens.</p>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-mcp-default-max-chars" class="field-label">Standardausgabe (Zeichen)</label>
+                  <input type="number" id="setting-mcp-default-max-chars" class="number-input" min="100" max="2000000" step="1" aria-describedby="mcp-default-help">
+                  <span class="field-hint" id="mcp-default-help">Textmenge, wenn der Assistent keine Länge angibt. Standard: 20.000 Zeichen.</span>
+                </div>
+                <div class="form-group">
+                  <label for="setting-mcp-max-output-chars" class="field-label">Maximale Ausgabe (Zeichen)</label>
+                  <input type="number" id="setting-mcp-max-output-chars" class="number-input" min="100" max="2000000" step="1" aria-describedby="mcp-max-help">
+                  <span class="field-hint" id="mcp-max-help">Obergrenze auch bei größeren Anfragen. Standard: 500.000, erlaubt: 100 bis 2.000.000 Zeichen.
+                    Muss mindestens der Standardausgabe entsprechen. Begrenzt den Dokumenttext, nicht Metadaten oder Verknüpfungen.</span>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="form-fieldset">
               <legend class="fieldset-legend">Suche &amp; Graph-Standardwerte</legend>
               <div class="form-grid-2">
                 <div class="form-group">

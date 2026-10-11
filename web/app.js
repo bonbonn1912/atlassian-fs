@@ -1276,6 +1276,8 @@
     ['setting-index-chunk-overlap-chars', 'index', 'chunk_overlap_chars', 'int'],
     ['setting-index-min-chunk-chars', 'index', 'min_chunk_chars', 'int'],
     ['setting-index-max-document-chars', 'index', 'max_document_chars', 'int'],
+    ['setting-mcp-default-max-chars', 'mcp', 'default_max_chars', 'int'],
+    ['setting-mcp-max-output-chars', 'mcp', 'max_output_chars', 'int'],
     ['setting-search-max-results', 'search', 'max_results', 'int'],
     ['setting-search-max-query-chars', 'search', 'max_query_chars', 'int'],
     ['setting-graph-max-visible-nodes', 'graph', 'max_visible_nodes', 'int'],
@@ -1566,6 +1568,16 @@
     }
     if (patch.graph && patch.graph.default_hops > patch.graph.max_hops) {
       errors.push('Standard-Hops darf nicht größer als Max. Hops sein');
+    }
+    if (patch.mcp) {
+      for (const [key, label] of [['default_max_chars', 'MCP-Standardausgabe'], ['max_output_chars', 'Maximale MCP-Ausgabe']]) {
+        if (patch.mcp[key] < 100 || patch.mcp[key] > 2000000) {
+          errors.push(`${label}: muss zwischen 100 und 2.000.000 Zeichen liegen`);
+        }
+      }
+      if (patch.mcp.default_max_chars > patch.mcp.max_output_chars) {
+        errors.push('MCP-Standardausgabe darf nicht größer als die maximale Ausgabe sein');
+      }
     }
     return { patch, errors };
   }

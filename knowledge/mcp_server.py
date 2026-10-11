@@ -5,9 +5,11 @@ import logging
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from knowledge import db, graph, search
+from knowledge.config import MCP_OUTPUT_MIN_CHARS, MCP_OUTPUT_MAX_CHARS, mcp_output_limits
+from knowledge.models import ConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +63,14 @@ TOOL_DEFINITIONS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "minimum": 100,
-                    "maximum": 50000,
-                    "description": "Maximum characters of body text to return (default 8000, max 50000)",
+                    "minimum": MCP_OUTPUT_MIN_CHARS,
+                    "maximum": MCP_OUTPUT_MAX_CHARS,
+                    "description": (
+                        "Requested body-text characters. Omit to use the default set in the UI "
+                        "(initially 20000). Clamped to the configured maximum output "
+                        "(initially 500000). Settings apply on the next call. Check truncated "
+                        "and total_chars in the response."
+                    ),
                 },
             },
             "required": ["uid"],
@@ -181,9 +188,11 @@ TOOL_MAP = {t["name"]: t for t in TOOL_DEFINITIONS}
 class McpServer:
     """JSON-RPC 2.0 MCP server over stdio for knowledge graph queries."""
 
-    def __init__(self, db_path: str | Path | sqlite3.Connection, cfg: dict | None = None) -> None:
+    def __init__(self, db_path: str | Path | sqlite3.Connection, cfg: dict | None = None,
+                 *, config_loader: Callable[[], dict] | None = None) -> None:
         self.db_path = db_path
         self.cfg = cfg or {}
+        self.config_loader = config_loader
         if isinstance(db_path, sqlite3.Connection):
             self._conn: sqlite3.Connection | None = db_path
         else:
@@ -271,13 +280,23 @@ class McpServer:
             uid = args.get("uid")
             if not isinstance(uid, str):
                 return self._tool_error("Parameter 'uid' muss ein String sein.")
-            max_chars = args.get("max_chars", 8000)
-            if not isinstance(max_chars, int) or max_chars < 100 or max_chars > 50000:
-                return self._tool_error("Parameter 'max_chars' muss zwischen 100 und 50000 liegen.")
+            try:
+                cfg = self.config_loader() if self.config_loader else self.cfg
+                default_chars, maximum_chars = mcp_output_limits(cfg)
+            except (ConfigError, OSError, TypeError) as exc:
+                logger.warning("MCP-Ausgabe-Einstellungen konnten nicht geladen werden: %s", exc)
+                return self._tool_error("MCP-Ausgabe-Einstellungen ungültig oder nicht lesbar. "
+                                        "Bitte in den Einstellungen korrigieren.")
+            requested = args.get("max_chars", default_chars)
+            if type(requested) is not int or not MCP_OUTPUT_MIN_CHARS <= requested <= MCP_OUTPUT_MAX_CHARS:
+                return self._tool_error(f"Parameter 'max_chars' muss eine Ganzzahl zwischen "
+                                        f"{MCP_OUTPUT_MIN_CHARS} und {MCP_OUTPUT_MAX_CHARS} sein.")
+            max_chars = min(requested, maximum_chars)
 
             doc = graph.get_document_detail(conn, uid, max_chars=max_chars)
             if doc is None:
                 return self._tool_error(f"Dokument mit UID {uid!r} nicht gefunden.")
+            doc["max_chars"] = max_chars
             return self._tool_success(doc)
 
         if name == "get_document_neighbors":
@@ -447,9 +466,11 @@ def run_stdio(
     cfg: dict | None = None,
     stdin: Any = sys.stdin,
     stdout: Any = sys.stdout,
+    *,
+    config_loader: Callable[[], dict] | None = None,
 ) -> None:
     """Run MCP server stdio event loop."""
-    server = McpServer(db_path, cfg)
+    server = McpServer(db_path, cfg, config_loader=config_loader)
     for line in stdin:
         line_str = line.strip() if isinstance(line, str) else line.decode("utf-8").strip()
         if not line_str:

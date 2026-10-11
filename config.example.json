@@ -61,6 +61,10 @@
     "max_results": 10,
     "max_query_chars": 200
   },
+  "mcp": {
+    "default_max_chars": 20000,
+    "max_output_chars": 500000
+  },
   "graph": {
     "max_visible_nodes": 150,
     "default_hops": 1,

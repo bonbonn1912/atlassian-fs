@@ -197,6 +197,22 @@ class TestWebServer(unittest.TestCase):
             return exc.code, resp_headers, body
 
     # 1. Static file serving and security headers
+    def test_mcp_output_settings_via_api(self) -> None:
+        original = self.config_store.get()['mcp']
+        try:
+            values = {'default_max_chars': 100000, 'max_output_chars': 250000}
+            status, _, body = self.make_request('PUT', '/api/settings', {'mcp': values})
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)['mcp'], values)
+            status, _, body = self.make_request('GET', '/api/settings')
+            self.assertEqual(json.loads(body)['mcp'], values)
+            self.assertEqual(ConfigStore(self.config_path).get()['mcp'], values)
+            status, _, _ = self.make_request('PUT', '/api/settings', {'mcp': {'max_output_chars': 50000}})
+            self.assertEqual(status, 400)
+            self.assertEqual(self.config_store.get()['mcp'], values)
+        finally:
+            self.config_store.update({'mcp': original})
+
     def test_static_index_html_with_security_headers(self) -> None:
         status, headers, body = self.make_request("GET", "/")
         self.assertEqual(status, 200)

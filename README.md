@@ -167,6 +167,36 @@ Der integrierte MCP-Server kommuniziert über `stdio` und erlaubt es KI-Assisten
 
 > **Wichtig:** Beim Aufruf von `app.py mcp` gehen alle Protokoll-Nachrichten über `stdout`. Jegliches Logging wird automatisch auf `stderr` umgeleitet, um das JSON-RPC-Protokoll nicht zu stören.
 
+### Dokumentausgabe und Tabellen
+
+Unter **Einstellungen → MCP-Dokumentausgabe** lassen sich die Standardausgabe
+(anfangs 20.000 Zeichen) und die maximale Ausgabe (anfangs 500.000 Zeichen)
+einstellen. Beide Werte erlauben 100 bis 2.000.000 Zeichen; die Standardausgabe darf
+die maximale Ausgabe nicht überschreiten. Gespeicherte Werte gelten beim nächsten
+Dokumentabruf auch in einem bereits laufenden `app.py mcp`-Prozess, sofern UI und
+MCP dieselbe Konfigurationsdatei verwenden (`--config`). Nach einem Code-Update
+müssen bestehende Serverprozesse einmal neu gestartet werden.
+
+`get_document` verwendet ohne `max_chars` die eingestellte Standardausgabe.
+Ein expliziter Wert wird auf die konfigurierte maximale Ausgabe begrenzt.
+Die Antwort enthält `max_chars` (angewendetes Limit), `total_chars`,
+`returned_chars` und `truncated`. Das Limit betrifft den Dokumenttext in Zeichen,
+nicht Tokens, Metadaten oder die Größe der gesamten JSON-Antwort. Sehr große
+Antworten können zusätzlich vom KI-Client begrenzt werden.
+
+Confluence-Storage- und Jira-ADF-Tabellen werden zellenweise in Markdown umgewandelt.
+Leere Zellen bleiben erhalten; Absätze innerhalb einer Zelle werden mit ` / ` getrennt,
+verbundene Zellen auf ihre Spalten/Zeilen verteilt und Kopfzeilen zusammengeführt.
+Verschachtelte Confluence-Tabellen erscheinen als beschrifteter Text in der äußeren
+Zelle. Tabellen ohne Kopfzeile erhalten neutrale Spaltennamen. Jira-Wiki-Tabellen
+verwenden dieselbe Darstellung. Große Tabellen werden für die Suche an Zeilengrenzen
+geteilt, mit wiederholtem Tabellenkopf pro Chunk. Eine einzelne sehr große Zeile darf
+die Chunk-Zielgröße überschreiten, um ihre Zellzuordnung zu erhalten.
+
+Bereits gespeicherte Seiten brauchen einen erneuten Abruf, da die Datenbank das
+ursprüngliche HTML nicht speichert. Nach Ende eines laufenden Crawls kann dies mit
+`python3 app.py refresh` erfolgen; dafür gelten die eingestellten Job-Budgets.
+
 ---
 
 ## 🛠️ CLI-Befehlsübersicht (`app.py`)

@@ -320,6 +320,8 @@ def get_document_detail(
         "last_error": row["last_error"],
         "labels": labels,
         "text": text,
+        "total_chars": len(body_text),
+        "returned_chars": len(text),
         "truncated": truncated,
         "outgoing": outgoing,
         "incoming": incoming,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 import re
 import threading
@@ -18,6 +19,24 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.json"
 CONFLUENCE_API_MODES = ("server", "cloud_v2")   # server = Server/Data Center REST /rest/api/content
 JIRA_API_MODES = ("server_v2", "cloud_v3")      # server_v2 = Server/Data Center REST /rest/api/2
 AUTH_TYPES = ("none", "bearer", "basic")
+MCP_OUTPUT_MIN_CHARS = 100
+MCP_OUTPUT_MAX_CHARS = 2_000_000
+MCP_DEFAULT_OUTPUT = {"default_max_chars": 20_000, "max_output_chars": 500_000}
+
+
+def mcp_output_limits(cfg: dict) -> tuple[int, int]:
+    """Validate both persisted settings and programmatically supplied MCP config."""
+    values = {**MCP_DEFAULT_OUTPUT, **cfg.get("mcp", {})}
+    for key, value in values.items():
+        if key not in MCP_DEFAULT_OUTPUT:
+            continue
+        if type(value) is not int or not MCP_OUTPUT_MIN_CHARS <= value <= MCP_OUTPUT_MAX_CHARS:
+            raise ConfigError(f"mcp.{key}: Ganzzahl zwischen {MCP_OUTPUT_MIN_CHARS} "
+                              f"und {MCP_OUTPUT_MAX_CHARS} erwartet")
+    default, maximum = values["default_max_chars"], values["max_output_chars"]
+    if default > maximum:
+        raise ConfigError("MCP-Standardausgabe darf nicht größer als die maximale Ausgabe sein")
+    return default, maximum
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "confluence": {
@@ -73,6 +92,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "index": {"chunk_target_chars": 1200, "chunk_overlap_chars": 150, "min_chunk_chars": 80,
               "max_document_chars": 2_000_000},
     "search": {"max_results": 10, "max_query_chars": 200},
+    "mcp": dict(MCP_DEFAULT_OUTPUT),
     "graph": {"max_visible_nodes": 5000, "default_hops": 1, "max_hops": 3},
     "server": {"host": "127.0.0.1", "port": 8765},
     "database": {"path": "data/knowledge.sqlite"},
@@ -142,6 +162,8 @@ SETTINGS_FIELD_SPECS: dict[str, dict[str, tuple]] = {
         "max_document_chars": ("int", 10_000, 50_000_000),
     },
     "search": {"max_results": ("int", 1, 10), "max_query_chars": ("int", 10, 1000)},
+    "mcp": {key: ("int", MCP_OUTPUT_MIN_CHARS, MCP_OUTPUT_MAX_CHARS)
+            for key in MCP_DEFAULT_OUTPUT},
     "graph": {
         "max_visible_nodes": ("int", 10, 20000),
         "default_hops": ("int", 0, 3),
@@ -189,7 +211,7 @@ def _check_value(spec: tuple, value: Any, name: str) -> tuple[Any, str | None]:
             num = float(value)
         except ValueError:
             return None, f"{name}: Ganzzahl erwartet"
-        if num != int(num):
+        if not math.isfinite(num) or num != int(num):
             return None, f"{name}: Ganzzahl erwartet"
         num = int(num)
         if not spec[1] <= num <= spec[2]:
@@ -478,6 +500,7 @@ class ConfigStore:
                     incoming.pop("clear_token", None)
 
             merged = _deep_merge(self._cfg, clean)
+            mcp_output_limits(merged)
             graph = merged.get("graph") or {}
             if int(graph.get("default_hops", 1)) > int(graph.get("max_hops", 3)):
                 raise ConfigError("graph.default_hops darf nicht größer als graph.max_hops sein")

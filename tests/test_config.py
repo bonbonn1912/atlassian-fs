@@ -18,6 +18,25 @@ from knowledge.config import (
 
 
 class TestConfigValidation(unittest.TestCase):
+    def test_mcp_limits_persist_and_partial_updates_validate_together(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            store = ConfigStore(path)
+            self.assertEqual(store.get()['mcp'], {'default_max_chars': 20000, 'max_output_chars': 500000})
+            store.update({'mcp': {'default_max_chars': 150000, 'max_output_chars': 200000}})
+            self.assertEqual(ConfigStore(path).get()['mcp']['default_max_chars'], 150000)
+            saved = path.read_bytes()
+            with self.assertRaises(ConfigError):
+                store.update({'mcp': {'max_output_chars': 100000}})
+            self.assertEqual(path.read_bytes(), saved)
+            self.assertEqual(store.get()['mcp']['max_output_chars'], 200000)
+
+    def test_mcp_limits_reject_invalid_numbers(self) -> None:
+        for value in (True, None, 99, 2000001, -1, 100.5, 'NaN', float('inf')):
+            with self.subTest(value=value):
+                _, errors = validate_settings_patch({'mcp': {'max_output_chars': value}})
+                self.assertTrue(errors)
+
     def test_spacekeylist_preserves_case_and_deduplicates(self) -> None:
         clean, errors = validate_settings_patch(
             {"confluence": {"selected_spaces": ["ENG", "eng", "~jsmith", "ENG"]}}

@@ -394,6 +394,24 @@ def _date(rng: random.Random) -> str:
                               minutes=rng.randint(0, 59))).isoformat(timespec="seconds")
 
 
+def _issue_dates(rng: random.Random) -> tuple[str, str]:
+    start = datetime(2025, 9, 1, tzinfo=timezone.utc)
+    created_dt = start + timedelta(
+        days=rng.randint(0, 300),
+        hours=rng.randint(7, 18),
+        minutes=rng.randint(0, 59),
+    )
+    updated_dt = created_dt + timedelta(
+        days=rng.randint(1, 90),
+        hours=rng.randint(1, 12),
+        minutes=rng.randint(0, 59),
+    )
+    return (
+        created_dt.isoformat(timespec="seconds"),
+        updated_dt.isoformat(timespec="seconds"),
+    )
+
+
 def _fill(template: str, topic: str, kws: list[str]) -> str:
     k = (kws * 3)[:3]
     return template.format(topic=topic, kw0=k[0], kw1=k[1], kw2=k[2])
@@ -589,11 +607,13 @@ def _issue_document(ctx: LinkContext, issue: _Issue, rng: random.Random) -> Fetc
         header.append("Labels: " + ", ".join(issue.labels))
     sections = [("", "\n".join(header))] + issue.description
     body = "\n\n".join(f"{h}\n{t}" if h else t for h, t in sections)
+    created_at, updated_at = _issue_dates(rng)
     return FetchedDocument(
         uid=jira_uid(issue.key), source_type="jira", source_id=issue.key,
         title=f"{issue.key}: {issue.summary}", url=jira_issue_url(ctx, issue.key), body_text=body,
         sections=sections, links=issue.links, space_or_project=issue.key.split("-")[0],
-        status_label=issue.status, document_type=issue.type, source_updated_at=_date(rng),
+        status_label=issue.status, document_type=issue.type,
+        source_created_at=created_at, source_updated_at=updated_at,
         labels=issue.labels)
 
 

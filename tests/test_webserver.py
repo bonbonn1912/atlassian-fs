@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import http.client
+import gzip
 import json
 from pathlib import Path
 import shutil
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,6 +85,9 @@ class TestWebServer(unittest.TestCase):
         (cls.web_dir / "index.html").write_text("<!DOCTYPE html><html><body>Test</body></html>", encoding="utf-8")
         (cls.web_dir / "style.css").write_text("body { color: blue; }", encoding="utf-8")
         (cls.web_dir / "app.js").write_text("console.log('app');", encoding="utf-8")
+        for filename in ('graph-flight.js', 'graph-flight-layout.js'):
+            (cls.web_dir / filename).write_text("console.log('flight');", encoding="utf-8")
+        (cls.web_dir / "graph-render-worker.js").write_text("console.log('worker');", encoding="utf-8")
         (cls.web_dir / "graph.js").write_text("console.log('graph');", encoding="utf-8")
 
         # Database
@@ -233,6 +238,20 @@ class TestWebServer(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers.get("content-type"), "application/javascript")
         self.assertIn(b"console.log", body)
+
+    def test_graph_flight_assets_are_served(self) -> None:
+        for filename in ('graph-flight.js', 'graph-flight-layout.js'):
+            with self.subTest(filename=filename):
+                status, headers, body = self.make_request('GET', '/' + filename)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers['content-type'], 'application/javascript')
+                self.assertIn(b'flight', body)
+
+    def test_graph_render_worker_is_served(self) -> None:
+        status, headers, body = self.make_request('GET', '/graph-render-worker.js')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['content-type'], 'application/javascript')
+        self.assertIn(b'worker', body)
 
     def test_static_path_traversal_protection(self) -> None:
         # Test using http.client to prevent client-side path normalization
@@ -539,6 +558,19 @@ class TestWebServer(unittest.TestCase):
         self.assertEqual(status, 404)
 
     # 9. /api/graph
+    @patch('knowledge.graph.get_subgraph', return_value={'nodes': [{'uid': f'jira:{i}', 'title': 'Test document'} for i in range(100)], 'edges': []})
+    def test_graph_compression_negotiation(self, _get_subgraph) -> None:
+        status, headers, body = self.make_request('GET', '/api/graph', headers={'Accept-Encoding': 'gzip'})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get('content-encoding'), 'gzip')
+        self.assertEqual(headers.get('vary'), 'Accept-Encoding')
+        expected = json.loads(gzip.decompress(body))
+        for encoding in ('identity', 'gzip;q=0', 'br'):
+            status, headers, body = self.make_request('GET', '/api/graph', headers={'Accept-Encoding': encoding})
+            self.assertEqual(status, 200)
+            self.assertNotIn('content-encoding', headers)
+            self.assertEqual(json.loads(body), expected)
+
     def test_api_graph(self) -> None:
         status, _, body = self.make_request("GET", "/api/graph?center=jira:ENG-1&hops=1")
         self.assertEqual(status, 200)

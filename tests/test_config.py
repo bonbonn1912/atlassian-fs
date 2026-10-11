@@ -18,6 +18,13 @@ from knowledge.config import (
 
 
 class TestConfigValidation(unittest.TestCase):
+    def test_graph_supports_100k_but_keeps_a_hard_limit(self) -> None:
+        clean, errors = validate_settings_patch({'graph': {'max_visible_nodes': 100000}})
+        self.assertEqual(errors, [])
+        self.assertEqual(clean['graph']['max_visible_nodes'], 100000)
+        _, errors = validate_settings_patch({'graph': {'max_visible_nodes': 100001}})
+        self.assertTrue(errors)
+
     def test_mcp_limits_persist_and_partial_updates_validate_together(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.json'

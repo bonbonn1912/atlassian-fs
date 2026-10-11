@@ -25,6 +25,7 @@ class TestGraph(unittest.TestCase):
         ]
 
         for uid, stype, sid, title, proj, dtype, status, labels, body in docs:
+            created_at = "2026-02-15T00:00:00Z" if stype == "jira" else None
             d = models.FetchedDocument(
                 uid=uid,
                 source_type=stype,
@@ -37,6 +38,7 @@ class TestGraph(unittest.TestCase):
                 status_label=status,
                 labels=[l.strip() for l in labels.split(",") if l.strip()],
                 source_version="1",
+                source_created_at=created_at,
                 source_updated_at="2026-03-01T00:00:00Z",
             )
             db.save_document(self.conn, d, [models.Chunk(heading="", body=body[:50])])
@@ -78,6 +80,15 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(b_node["in_degree"], 1)
         self.assertEqual(b_node["out_degree"], 2)
         self.assertEqual(b_node["degree"], 3)
+        self.assertEqual(b_node["project"], "ENG")
+        self.assertEqual(b_node["source_created_at"], "2026-02-15T00:00:00Z")
+        self.assertEqual(b_node["source_updated_at"], "2026-03-01T00:00:00Z")
+
+        # Confluence node payload includes None for source_created_at, ISO string for source_updated_at, and project
+        a_node = next(n for n in sub["nodes"] if n["uid"] == "confluence:A")
+        self.assertEqual(a_node["project"], "ENG")
+        self.assertIsNone(a_node["source_created_at"])
+        self.assertEqual(a_node["source_updated_at"], "2026-03-01T00:00:00Z")
 
         # Edges must only be between included nodes
         for e in sub["edges"]:
@@ -96,6 +107,11 @@ class TestGraph(unittest.TestCase):
         sub3 = graph.get_subgraph(self.conn, "confluence:A", hops=10)
         node_uids = {n["uid"] for n in sub3["nodes"]}
         self.assertIn("jira:D", node_uids)
+        # Unindexed reference node G has None for dates and project
+        g_node = next(n for n in sub3["nodes"] if n["uid"] == "confluence:G")
+        self.assertIsNone(g_node["source_created_at"])
+        self.assertIsNone(g_node["source_updated_at"])
+        self.assertIsNone(g_node["project"])
 
     def test_get_subgraph_max_nodes_truncation(self) -> None:
         # Limit to 2 nodes
@@ -135,8 +151,15 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(len(sub["nodes"]), 3)
         # jira:B has highest degree (incident edges: A->B, B->C, B->E = 3)
         self.assertEqual(sub["nodes"][0]["uid"], "jira:B")
+        self.assertEqual(sub["nodes"][0]["project"], "ENG")
+        self.assertEqual(sub["nodes"][0]["source_created_at"], "2026-02-15T00:00:00Z")
+        self.assertEqual(sub["nodes"][0]["source_updated_at"], "2026-03-01T00:00:00Z")
         self.assertTrue(sub["truncated"])
         self.assertGreater(sub["hidden_nodes"], 0)
+        for n in sub["nodes"]:
+            self.assertIn("source_created_at", n)
+            self.assertIn("source_updated_at", n)
+            self.assertIn("project", n)
 
     def test_get_document_detail(self) -> None:
         doc = graph.get_document_detail(self.conn, "jira:B", max_chars=50)
@@ -149,6 +172,8 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(doc["status"], "DONE")
         self.assertEqual(doc["document_type"], "Story")
         self.assertEqual(doc["source_version"], "1")
+        self.assertEqual(doc["source_created_at"], "2026-02-15T00:00:00Z")
+        self.assertEqual(doc["source_updated_at"], "2026-03-01T00:00:00Z")
         self.assertEqual(doc["updated_at"], "2026-03-01T00:00:00Z")
         self.assertEqual(doc["state"], "indexed")
         self.assertIsNotNone(doc["fetched_at"])
@@ -165,10 +190,28 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(len(doc["outgoing"]), 2)
         out_targets = {e["target"]["uid"] for e in doc["outgoing"]}
         self.assertEqual(out_targets, {"confluence:C", "jira:E"})
+        e_target = next(e["target"] for e in doc["outgoing"] if e["target"]["uid"] == "jira:E")
+        self.assertEqual(e_target["project"], "ENG")
+        self.assertEqual(e_target["source_created_at"], "2026-02-15T00:00:00Z")
+        self.assertEqual(e_target["source_updated_at"], "2026-03-01T00:00:00Z")
+        c_target = next(e["target"] for e in doc["outgoing"] if e["target"]["uid"] == "confluence:C")
+        self.assertEqual(c_target["project"], "HR")
+        self.assertIsNone(c_target["source_created_at"])
+        self.assertEqual(c_target["source_updated_at"], "2026-03-01T00:00:00Z")
 
         # Incoming: A -> B (links_to)
         self.assertEqual(len(doc["incoming"]), 1)
-        self.assertEqual(doc["incoming"][0]["source"]["uid"], "confluence:A")
+        a_source = doc["incoming"][0]["source"]
+        self.assertEqual(a_source["uid"], "confluence:A")
+        self.assertEqual(a_source["project"], "ENG")
+        self.assertIsNone(a_source["source_created_at"])
+        self.assertEqual(a_source["source_updated_at"], "2026-03-01T00:00:00Z")
+
+        # Confluence detail has source_created_at=None
+        doc_a = graph.get_document_detail(self.conn, "confluence:A")
+        self.assertIsNotNone(doc_a)
+        self.assertIsNone(doc_a["source_created_at"])
+        self.assertEqual(doc_a["source_updated_at"], "2026-03-01T00:00:00Z")
 
     def test_get_document_detail_not_found(self) -> None:
         doc = graph.get_document_detail(self.conn, "jira:UNKNOWN")
@@ -193,12 +236,21 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(nbrs_out["total"], 2)
         self.assertEqual(len(nbrs_out["outgoing"]), 2)
         self.assertEqual(len(nbrs_out["incoming"]), 0)
+        e_target_nb = next(e["target"] for e in nbrs_out["outgoing"] if e["target"]["uid"] == "jira:E")
+        self.assertEqual(e_target_nb["project"], "ENG")
+        self.assertEqual(e_target_nb["source_created_at"], "2026-02-15T00:00:00Z")
+        self.assertEqual(e_target_nb["source_updated_at"], "2026-03-01T00:00:00Z")
 
         # In only
         nbrs_in = graph.get_neighbors(self.conn, "jira:B", direction="in")
         self.assertEqual(nbrs_in["total"], 1)
         self.assertEqual(len(nbrs_in["outgoing"]), 0)
         self.assertEqual(len(nbrs_in["incoming"]), 1)
+        a_source_nb = nbrs_in["incoming"][0]["source"]
+        self.assertEqual(a_source_nb["uid"], "confluence:A")
+        self.assertEqual(a_source_nb["project"], "ENG")
+        self.assertIsNone(a_source_nb["source_created_at"])
+        self.assertEqual(a_source_nb["source_updated_at"], "2026-03-01T00:00:00Z")
 
     def test_find_related(self) -> None:
         # Unknown UID
@@ -218,14 +270,20 @@ class TestGraph(unittest.TestCase):
         self.assertIn("confluence:C", uids)
         self.assertIn("jira:E", uids)
 
-        # Direct neighbor has is_direct=True
+        # Direct neighbor has is_direct=True, project and timestamps
         b_entry = next(r for r in related["related"] if r["uid"] == "jira:B")
         self.assertTrue(b_entry["is_direct"])
+        self.assertEqual(b_entry["project"], "ENG")
+        self.assertEqual(b_entry["source_created_at"], "2026-02-15T00:00:00Z")
+        self.assertEqual(b_entry["source_updated_at"], "2026-03-01T00:00:00Z")
 
-        # 2nd-degree neighbor has shared_count >= 1
+        # 2nd-degree neighbor has shared_count >= 1, project and timestamps
         c_entry = next(r for r in related["related"] if r["uid"] == "confluence:C")
         self.assertEqual(c_entry["shared_count"], 1)
         self.assertFalse(c_entry["is_direct"])
+        self.assertEqual(c_entry["project"], "HR")
+        self.assertIsNone(c_entry["source_created_at"])
+        self.assertEqual(c_entry["source_updated_at"], "2026-03-01T00:00:00Z")
 
     def test_get_top_documents(self) -> None:
         # Add an extra link pointing to jira:B to make it the top linked document (2 incoming)
@@ -237,6 +295,9 @@ class TestGraph(unittest.TestCase):
         docs = res["documents"]
         # jira:B should be rank 1 with 2 incoming links
         self.assertEqual(docs[0]["uid"], "jira:B")
+        self.assertEqual(docs[0]["project"], "ENG")
+        self.assertEqual(docs[0]["source_created_at"], "2026-02-15T00:00:00Z")
+        self.assertEqual(docs[0]["source_updated_at"], "2026-03-01T00:00:00Z")
         self.assertEqual(docs[0]["incoming_count"], 2)
         self.assertEqual(docs[0]["outgoing_count"], 2)
         self.assertEqual(docs[0]["total_degree"], 4)
@@ -268,3 +329,23 @@ class TestGraph(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLargeGraph(unittest.TestCase):
+    def test_100k_overview_and_truncation(self) -> None:
+        conn = db.open_db(":memory:")
+        try:
+            with conn:
+                conn.executemany(
+                    "INSERT INTO documents(uid, source_type, source_id) VALUES (?, 'jira', ?)",
+                    ((f"jira:LOAD-{i}", str(i)) for i in range(100001)),
+                )
+                conn.execute("INSERT INTO edges(source_doc,target_doc,kind) VALUES (1,100000,'links_to')")
+            data = graph.get_subgraph(conn, None, max_nodes=100000)
+            self.assertEqual(len(data['nodes']), 100000)
+            self.assertTrue(data['truncated'])
+            self.assertEqual(data['hidden_nodes'], 1)
+            self.assertEqual(len(data['edges']), 1)
+            self.assertEqual(len({node['uid'] for node in data['nodes']}), 100000)
+        finally:
+            conn.close()

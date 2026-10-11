@@ -1,6 +1,7 @@
 """HTTP Webserver and REST API for local-knowledge application."""
 from __future__ import annotations
 
+import gzip
 import http.server
 import json
 import logging
@@ -33,6 +34,9 @@ STATIC_FILES: dict[str, str] = {
     "/style.css": "style.css",
     "/app.js": "app.js",
     "/graph.js": "graph.js",
+    "/graph-flight.js": "graph-flight.js",
+    "/graph-flight-layout.js": "graph-flight-layout.js",
+    "/graph-render-worker.js": "graph-render-worker.js",
     "/graph-layout-worker.js": "graph-layout-worker.js",
 }
 
@@ -119,14 +123,33 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; img-src 'self' data:")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
-        if is_json:
-            self.send_header("Cache-Control", "no-store")
+        # Static JS/CSS must never be cached so a server restart after an
+        # update always delivers the current files.
+        self.send_header("Cache-Control", "no-store")
 
     def send_json(self, status: int, data: Any) -> None:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        is_graph = urllib.parse.urlsplit(self.path).path == "/api/graph"
+        body = json.dumps(data, ensure_ascii=False, separators=(",", ":") if is_graph else None).encode("utf-8")
+        compress = False
+        if is_graph and len(body) >= 1024:
+            for part in self.headers.get("Accept-Encoding", "").split(","):
+                encoding, _, params = part.strip().partition(";")
+                if encoding.lower() != "gzip":
+                    continue
+                try:
+                    quality = float(params.strip().removeprefix("q=")) if params else 1
+                except ValueError:
+                    quality = 0
+                compress = 0 < quality <= 1
+            if compress:
+                body = gzip.compress(body, compresslevel=1, mtime=0)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if is_graph:
+            self.send_header("Vary", "Accept-Encoding")
+        if compress:
+            self.send_header("Content-Encoding", "gzip")
         self._set_security_headers(is_json=True)
         self.end_headers()
         self.wfile.write(body)

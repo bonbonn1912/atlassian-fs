@@ -20,7 +20,8 @@ from .models import (
 )
 
 SCHEMA_V1 = """
-CREATE TABLE IF NOT EXISTS documents (\n  id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE,
+CREATE TABLE IF NOT EXISTS documents (
+  id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE,
   source_type TEXT NOT NULL CHECK(source_type IN ('confluence','jira')),
   source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
   url TEXT NOT NULL DEFAULT '', space_or_project TEXT,
@@ -104,7 +105,12 @@ CREATE TABLE IF NOT EXISTS title_resolutions (
 );
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2)]
+# Add source_created_at to documents table.
+SCHEMA_V3 = """
+ALTER TABLE documents ADD COLUMN source_created_at TEXT;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)]
 
 # Negative results are re-checked after this many seconds (page may be created later).
 TITLE_RESOLUTION_MISS_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -166,7 +172,12 @@ def init_db(conn: sqlite3.Connection) -> int:
             continue
         with transaction(conn):
             for statement in _split_sql(sql):
-                conn.execute(statement)
+                try:
+                    conn.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" in str(exc).lower():
+                        continue
+                    raise
             conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)",
                          (version, now_iso()))
     return max(v for v, _ in MIGRATIONS)
@@ -267,15 +278,19 @@ def save_document(conn: sqlite3.Connection, doc: FetchedDocument, chunks: list[C
     labels = ",".join(doc.labels)
     with transaction(conn):
         doc_id = ensure_node(conn, doc.uid)
-        old = conn.execute("SELECT content_hash, state FROM documents WHERE id=?", (doc_id,)).fetchone()
+        old = conn.execute("SELECT content_hash, state, source_created_at, source_updated_at FROM documents WHERE id=?", (doc_id,)).fetchone()
         has_chunks = conn.execute("SELECT 1 FROM chunks WHERE document_id=? LIMIT 1", (doc_id,)).fetchone()
         changed = old["content_hash"] != content_hash or not has_chunks
+        old_created = old["source_created_at"] if old else None
+        created_at = doc.source_created_at if (doc.source_created_at is not None and doc.source_created_at != "") else old_created
+        old_updated = old["source_updated_at"] if old else None
+        updated_at = doc.source_updated_at if (doc.source_updated_at is not None and doc.source_updated_at != "") else old_updated
         conn.execute(
             "UPDATE documents SET title=?, url=?, space_or_project=?, status_label=?, document_type=?, "
-            "body_text=?, source_version=?, source_updated_at=?, content_hash=?, state=?, "
+            "body_text=?, source_version=?, source_created_at=?, source_updated_at=?, content_hash=?, state=?, "
             "fetched_at=?, last_error=NULL, labels=? WHERE id=?",
             (doc.title, doc.url, doc.space_or_project, doc.status_label, doc.document_type,
-             doc.body_text, doc.source_version, doc.source_updated_at, content_hash,
+             doc.body_text, doc.source_version, created_at, updated_at, content_hash,
              STATE_INDEXED, now_iso(), labels, doc_id))
         if changed:
             conn.execute("DELETE FROM chunks WHERE document_id=?", (doc_id,))

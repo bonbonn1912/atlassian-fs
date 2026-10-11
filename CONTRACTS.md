@@ -442,7 +442,7 @@ Routen (alle JSON, Fehler als `{"error": {"code": "...", "message": "..."}}`):
 | GET | `/api/projects` | `{"projects": list_projects}` |
 | GET | `/api/top-documents?types=&limit=&offset=&project=&q=` | `graph.get_top_documents(...)` (Rang nach ein-/ausgehenden Kanten; `types` = `all`/`confluence`/`jira`, 400 bei ungültigem Typ/Limit) |
 | GET | `/api/documents/{uid}` | `{"document": get_document_detail}`; 404 (uid URL-decoded) |
-| GET | `/api/graph?center=&hops=&max_nodes=&types=&edge_kinds=a,b` | get_subgraph (hops ≤ graph.max_hops, max_nodes ≤ graph.max_visible_nodes) |
+| GET | `/api/graph?center=&hops=&max_nodes=&types=&edge_kinds=a,b` | get_subgraph (hops ≤ graph.max_hops, max_nodes ≤ graph.max_visible_nodes ≤ 100000; gzip bei Accept-Encoding: gzip) |
 | GET | `/api/stats` | db.get_stats |
 
 Request-Body max 1 MB, nur `application/json`. Host-Header-Check gegen DNS-Rebinding (nur

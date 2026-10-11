@@ -124,6 +124,7 @@ class JiraClient:
             url=jira_issue_url(self.ctx, key), body_text=body_text, sections=sections,
             links=_dedupe(links), space_or_project=project, status_label=status,
             document_type=issue_type, source_version=None,
+            source_created_at=fields.get("created"),
             source_updated_at=fields.get("updated"), labels=labels)
 
     def fetch_document(self, issue_key: str, *, include_remote_links: bool,

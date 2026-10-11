@@ -7,6 +7,8 @@
   <link rel="stylesheet" href="style.css">
   <script defer src="graph-layout-worker.js"></script>
   <script defer src="graph.js"></script>
+  <script defer src="graph-flight-layout.js"></script>
+  <script defer src="graph-flight.js"></script>
   <script defer src="app.js"></script>
 </head>
 <body>
@@ -458,7 +460,7 @@
 
             <div class="graph-control-item">
               <label for="graph-max-nodes-input" class="toolbar-label">Max. Knoten:</label>
-              <input type="number" id="graph-max-nodes-input" class="number-input number-sm" value="5000" min="10" max="20000">
+              <input type="number" id="graph-max-nodes-input" class="number-input number-sm" value="5000" min="10" max="100000">
             </div>
 
             <div class="graph-control-item">
@@ -513,6 +515,26 @@
               <span>Wichtigkeits-Modus</span>
             </button>
 
+            <button type="button" class="btn btn-secondary btn-sm" id="graph-flight-btn" aria-pressed="false" aria-controls="graph-flight-container" title="Durch Spaces und ihre Geschichte fliegen">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" class="btn-leading-icon">
+                <path d="m12 2 9 5v10l-9 5-9-5V7Z M3 7l9 5 9-5 M12 12v10"></path>
+              </svg>
+              <span>3D-Zeitflug</span>
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" id="graph-timeline-btn" aria-pressed="false" title="Zeitachse mit Jahreszahlen entlang der Zeitrichtung" hidden>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="btn-leading-icon">
+                <path d="M3 12h18 M6 9v6 M12 7v10 M18 9v6"></path>
+              </svg>
+              <span>Zeitachse</span>
+            </button>
+            <div class="graph-control-item" id="graph-flight-time-control" hidden>
+              <label for="graph-flight-jira-time" class="toolbar-label">Jira-Zeitachse:</label>
+              <select id="graph-flight-jira-time" class="select-input select-sm">
+                <option value="updated">Letzte Änderung</option>
+                <option value="created">Erstellt am</option>
+              </select>
+            </div>
+
             <div class="graph-toolbar-spacer"></div>
 
             <div class="graph-zoom-controls">
@@ -528,11 +550,31 @@
             <span id="graph-banner-text">Weitere Knoten ausgeblendet. Erhöhe „Max. Knoten“ oder verringere Hops.</span>
           </div>
 
-          <!-- Main workspace: SVG Canvas + Inspector -->
+          <!-- Main workspace: Canvas + Inspector -->
           <div class="graph-workspace">
             <div class="graph-canvas-container" id="graph-canvas-container">
               <canvas id="graph-canvas" class="graph-canvas" tabindex="0" role="application"
                       aria-label="Knowledge Graph. Pfeiltasten wählen Knoten, Enter lädt als Zentrum, Plus/Minus zoomt, 0 zeigt alles."></canvas>
+
+              <div id="graph-flight-container" class="graph-flight-container" hidden>
+                <canvas id="graph-flight-canvas" class="graph-canvas" tabindex="0" role="application"
+                        aria-label="3D-Zeitflug. Ziehen zum Umsehen. W und S oder Mausrad fliegen vor und zurück, A und D seitwärts, Q und E hoch und runter. Null setzt die Ansicht zurück."
+                        aria-describedby="graph-flight-help"></canvas>
+              </div>
+              <div id="graph-flight-hud" class="graph-flight-hud" hidden>
+                <div class="graph-flight-time-caption">Vorne neu · hinten alt</div>
+                <div id="graph-flight-status" role="status" aria-live="polite">Raum wird vorbereitet …</div>
+                <div class="graph-flight-date-hint">Confluence: letzte Änderung</div>
+                <div id="graph-flight-unknown" class="graph-flight-date-hint" hidden></div>
+              </div>
+              <details id="graph-flight-help" class="graph-flight-help" hidden>
+                <summary>Flugsteuerung</summary>
+                <p>Ziehen: umsehen · Mausrad oder W/S: vor/zurück · A/D: seitwärts · Q/E: hoch/runter · 0: Startposition.</p>
+                <p>Klick: Details · Doppelklick: als Zentrum laden. Tastatursteuerung ist aktiv, wenn der Raum fokussiert ist.</p>
+                <p>Titel naher Objekte erscheinen beim Vorbeiflug automatisch (max. ~8 im Blickfeld).</p>
+                <p>Zeitachse zeigt Jahreszahlen entlang der Flugrichtung, standardmäßig aus.</p>
+                <p>Seiten bilden Space-Cluster. Verknüpfte Tickets liegen beim Space, weitere Tickets in ihrem Jira-Projekt.</p>
+              </details>
 
               <!-- Graph Legend Overlay -->
               <div class="graph-legend" id="graph-legend" aria-label="Graph Legende">
@@ -957,7 +999,7 @@
                 </div>
                 <div class="form-group">
                   <label for="setting-graph-max-visible-nodes" class="field-label">Max. sichtbare Knoten im Graph</label>
-                  <input type="number" id="setting-graph-max-visible-nodes" class="number-input" min="10" max="20000">
+                  <input type="number" id="setting-graph-max-visible-nodes" class="number-input" min="10" max="100000">
                 </div>
                 <div class="form-group">
                   <label for="setting-graph-default-hops" class="field-label">Standard-Hops</label>

@@ -1,9 +1,9 @@
 /**
  * Knowledge-Graph-Renderer auf Canvas.
  *
- * - Layout läuft in graph-layout-worker.js (Barnes-Hut, Kollision, keine Überlappungen).
+ * - Layout im Worker: Barnes-Hut für kleine, mehrstufiges Layout für große Graphen.
  * - Rendering per Canvas mit Viewport-Culling und gebündelten Pfaden pro Stil,
- *   damit auch mehrere tausend Knoten flüssig bleiben.
+ *   sowie OffscreenCanvas-Worker und Bild-Cache für bis zu 100.000 Knoten.
  * - Beschriftungen werden nach Priorität platziert und nie übereinander gezeichnet;
  *   beim Hineinzoomen erscheinen automatisch mehr.
  * Vanilla JS, keine externen Abhängigkeiten, kein innerHTML.
@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const MIN_ZOOM = 0.02;
+  const MIN_ZOOM = 0.0001;
   const MAX_ZOOM = 8;
   const LABEL_FONT_PX = 12;
   const MAX_LABELS = 700;
@@ -38,6 +38,75 @@
     return text.length > max ? text.slice(0, max - 1) + '…' : text;
   }
 
+  // Bounding-volume hierarchy: query nodes AND long crossing edges without
+  // scanning the entire graph or duplicating edges across thousands of grid cells.
+  class SpatialIndex {
+    constructor(items, bounds, deferred = false) {
+      this.items = items;
+      this.order = new Uint32Array(items.length);
+      this.boxes = new Float64Array(items.length * 4);
+      this.steps = this._initialize(bounds);
+      if (!deferred) while (!this.steps.next().done) { /* synchronous worker path */ }
+    }
+
+    *_initialize(bounds) {
+      const items = this.items;
+      for (let i = 0; i < items.length; i++) {
+        if (i % 4096 === 0) yield;
+        this.order[i] = i;
+        this.boxes.set(bounds(items[i]), i * 4);
+      }
+      this.root = yield* this._build(0, items.length);
+    }
+
+    *_build(start, end) {
+      if (start === end) return null;
+      const { order, boxes } = this;
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = start; i < end; i++) {
+        if ((i - start) % 8192 === 0 && i > start) yield;
+        const b = order[i] * 4;
+        x0 = Math.min(x0, boxes[b]); y0 = Math.min(y0, boxes[b + 1]);
+        x1 = Math.max(x1, boxes[b + 2]); y1 = Math.max(y1, boxes[b + 3]);
+      }
+      const node = { x0, y0, x1, y1, start, end };
+      if (end - start <= 32) return node;
+      const axis = x1 - x0 > y1 - y0 ? 0 : 1;
+      const middle = axis ? (y0 + y1) / 2 : (x0 + x1) / 2;
+      let split = start;
+      for (let i = start; i < end; i++) {
+        if ((i - start) % 8192 === 0 && i > start) yield;
+        const b = order[i] * 4 + axis;
+        if ((boxes[b] + boxes[b + 2]) / 2 < middle) {
+          const tmp = order[split]; order[split++] = order[i]; order[i] = tmp;
+        }
+      }
+      // Bound recursion even for coincident nodes or highly skewed edge bounds.
+      if (split - start < (end - start) / 16 || end - split < (end - start) / 16) split = (start + end) >>> 1;
+      if (end - start >= 1024) yield;
+      node.left = yield* this._build(start, split);
+      node.right = yield* this._build(split, end);
+      return node;
+    }
+
+    query(x0, y0, x1, y1) {
+      const result = [];
+      const { items, order, boxes } = this;
+      const visit = (node) => {
+        if (!node || node.x1 < x0 || node.x0 > x1 || node.y1 < y0 || node.y0 > y1) return;
+        if (x0 <= node.x0 && y0 <= node.y0 && x1 >= node.x1 && y1 >= node.y1) {
+          for (let i = node.start; i < node.end; i++) result.push(items[order[i]]);
+        } else if (node.left) { visit(node.left); visit(node.right); }
+        else for (let i = node.start; i < node.end; i++) {
+          const index = order[i], b = index * 4;
+          if (boxes[b + 2] >= x0 && boxes[b] <= x1 && boxes[b + 3] >= y0 && boxes[b + 1] <= y1) result.push(items[index]);
+        }
+      };
+      visit(this.root);
+      return result;
+    }
+  }
+
   class KnowledgeGraph {
     /**
      * @param {Object} options
@@ -47,6 +116,7 @@
      * @param {Function} [options.onNodeActivate] (node) => void  (Doppelklick / Enter)
      * @param {Function} [options.onEdgeSelect]   (edge) => void
      * @param {Function} [options.onLayoutProgress] (progress 0..1, done:boolean) => void
+     * @param {Function} [options.onRenderReady] first completed frame for a layout
      * @param {string} [options.workerUrl]
      */
     constructor(options) {
@@ -57,6 +127,7 @@
       this.onNodeActivate = options.onNodeActivate || (() => {});
       this.onEdgeSelect = options.onEdgeSelect || (() => {});
       this.onLayoutProgress = options.onLayoutProgress || (() => {});
+      this.onRenderReady = options.onRenderReady || (() => {});
       this.workerUrl = options.workerUrl || 'graph-layout-worker.js';
 
       this.nodes = [];
@@ -76,6 +147,9 @@
       this.layoutDone = true;
       this.worker = null;
       this.layoutId = 0;
+      this.dataId = 0;
+      this.sceneVersion = 0;
+      this.frameCache = null;
       this.drawPending = false;
       this.grid = null;               // spatial hash for hit testing
       this.keyboardIndex = -1;
@@ -104,6 +178,8 @@
     // ---------------------------------------------------------------- data
 
     _readColors() {
+      this.sceneVersion++;
+      this.fontFamily = cssVar('--font-sans', 'sans-serif');
       this.colors = {
         confluence: cssVar('--confluence-blue', '#1868db'),
         jira: cssVar('--jira-orange', '#e2740d'),
@@ -150,7 +226,37 @@
       this._startLayout();
     }
 
-    setData(data, centerUid) {
+    async setData(data, centerUid) {
+      const dataId = ++this.dataId;
+      this._stopLayout();
+      // Prepare in small batches, keeping the previous graph valid until commit.
+      const nodes = [], edges = [], nodeMap = new Map(), edgeMap = new Map();
+      let deadline = performance.now() + 8;
+      const breathe = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        deadline = performance.now() + 8;
+      };
+      for (const n of data.nodes || []) {
+        const node = { ...n, idx: nodes.length, x: 0, y: 0, r: 0, label: truncate(n.title || n.uid, 34) };
+        nodes.push(node);
+        nodeMap.set(node.uid, node);
+        if (nodes.length % 1024 === 0 && performance.now() >= deadline) {
+          await breathe();
+          if (dataId !== this.dataId) return;
+        }
+      }
+      for (const e of data.edges || []) {
+        const source = nodeMap.get(e.source), target = nodeMap.get(e.target);
+        if (!source || !target) continue;
+        const edge = { ...e, s: source, t: target, _id: String(e.id ?? `${e.source}->${e.target}:${e.kind}`) };
+        edges.push(edge);
+        edgeMap.set(edge._id, edge);
+        if (edges.length % 1024 === 0 && performance.now() >= deadline) {
+          await breathe();
+          if (dataId !== this.dataId) return;
+        }
+      }
+      if (dataId !== this.dataId) return;
       this.centerUid = centerUid || data.center || null;
       this.selectedUid = null;
       this.selectedEdgeId = null;
@@ -160,38 +266,35 @@
       this.keyboardIndex = -1;
       this.userMovedView = false;
 
-      this.nodeMap.clear();
-      this.nodes = (data.nodes || []).map((n, idx) => {
-        const node = { ...n, idx, x: 0, y: 0 };
-        node.label = truncate(node.title || node.uid, 34);
-        this.nodeMap.set(node.uid, node);
-        return node;
-      });
+      this.nodes = nodes; this.edges = edges;
+      this.nodeMap = nodeMap; this.edgeMap = edgeMap;
       this._computeRadii();
-      this.edgeMap.clear();
-      this.edges = [];
-      for (const e of data.edges || []) {
-        const s = this.nodeMap.get(e.source);
-        const t = this.nodeMap.get(e.target);
-        if (!s || !t) continue;
-        const edge = { ...e, s, t, _id: String(e.id ?? `${e.source}->${e.target}:${e.kind}`) };
-        this.edges.push(edge);
-        this.edgeMap.set(edge._id, edge);
-      }
-      this.adjacency = new Map();
-      for (const e of this.edges) {
-        if (!this.adjacency.has(e.source)) this.adjacency.set(e.source, new Set());
-        if (!this.adjacency.has(e.target)) this.adjacency.set(e.target, new Set());
-        this.adjacency.get(e.source).add(e.target);
-        this.adjacency.get(e.target).add(e.source);
-      }
+      // Neighbours are needed only for the selected node; avoid 100k Sets.
       this.keyboardOrder = [...this.nodes].sort((a, b) => (b.degree || 0) - (a.degree || 0) || (a.uid < b.uid ? -1 : 1));
       this._startLayout();
     }
 
-    _startLayout() {
+    cancelPending() {
+      ++this.dataId;
+      this._stopLayout();
+    }
+
+    _stopLayout() {
+      ++this.layoutId;
+      clearTimeout(this.layoutWatchdog);
       if (this.worker) this.worker.terminate();
       this.worker = null;
+      if (this.renderWorker) this.renderWorker.terminate();
+      this.renderWorker = null;
+      this.renderBusy = false;
+    }
+
+    _startLayout() {
+      this._stopLayout();
+      this.grid = this.nodeIndex = this.edgeIndex = null;
+      this.sceneVersion++;
+      this.positionsReady = false;
+      this._releaseFrame();
       const n = this.nodes.length;
       const center = this.centerUid && this.nodeMap.has(this.centerUid) ? this.nodeMap.get(this.centerUid).idx : -1;
       if (n === 0) {
@@ -215,6 +318,7 @@
       const msg = { id, count: n, radii, links, center, importanceMode: this.importanceMode, importance };
       const handle = (m) => {
         if (m.id !== id || id !== this.layoutId) return;
+        if (m.type === 'ready') return;
         if (m.type === 'error') {
           console.error('Layout-Fehler:', m.message);
           this._gridLayout();
@@ -236,18 +340,23 @@
       this.worker = worker;
       let heardBack = false;
       // Some embedded browsers block workers silently: fall back after 2 s of silence.
-      const watchdog = setTimeout(() => {
-        if (heardBack || id !== this.layoutId) return;
+      const fallback = () => {
+        if (id !== this.layoutId) return;
         worker.terminate();
-        if (this.worker === worker) this.worker = null;
-        this._mainThreadLayout({ ...msg, radii: Float32Array.from(this.nodes.map((nd) => nd.r)),
-                                 importance: Float32Array.from(this.nodes.map((nd) => nd.in_degree ?? 0)),
-                                 links: Uint32Array.from(this.edges.flatMap((e) => [e.s.idx, e.t.idx])) }, handle);
-      }, 2000);
+        this.worker = null;
+        // Transferred arrays are detached; recreate only if fallback is needed.
+        const radii = new Float32Array(n), importance = new Float32Array(n);
+        const links = new Uint32Array(this.edges.length * 2);
+        for (const nd of this.nodes) { radii[nd.idx] = nd.r; importance[nd.idx] = nd.in_degree ?? 0; }
+        this.edges.forEach((e, i) => { links[2 * i] = e.s.idx; links[2 * i + 1] = e.t.idx; });
+        this._mainThreadLayout({ ...msg, radii, importance, links }, handle);
+      };
+      this.layoutWatchdog = setTimeout(() => { if (!heardBack) fallback(); }, 2000);
       worker.onmessage = (ev) => {
+        if (id !== this.layoutId) return;
         heardBack = true;
-        clearTimeout(watchdog);
-        if (ev.data.type === 'done') {
+        clearTimeout(this.layoutWatchdog);
+        if (ev.data.type === 'done' || ev.data.type === 'error') {
           worker.terminate();
           if (this.worker === worker) this.worker = null;
         }
@@ -255,27 +364,28 @@
       };
       worker.onerror = (ev) => {
         ev.preventDefault();
-        clearTimeout(watchdog);
-        if (heardBack) { this._gridLayout(); return; }
-        heardBack = true;
-        this._mainThreadLayout({ ...msg, radii: Float32Array.from(this.nodes.map((nd) => nd.r)),
-                                 importance: Float32Array.from(this.nodes.map((nd) => nd.in_degree ?? 0)),
-                                 links: Uint32Array.from(this.edges.flatMap((e) => [e.s.idx, e.t.idx])) }, handle);
+        clearTimeout(this.layoutWatchdog);
+        fallback();
       };
-      // Copies are sent so the main-thread fallback could still use the originals.
-      worker.postMessage({ ...msg, radii: radii.slice(), links: links.slice() });
+      try { worker.postMessage(msg, [radii.buffer, links.buffer, importance.buffer]); }
+      catch (err) { clearTimeout(this.layoutWatchdog); fallback(); }
     }
 
-    _applyPositions(p, done, progress) {
+    async _applyPositions(p, done, progress) {
+      if (this.nodes.length > 5000 && !done) { this.onLayoutProgress(progress, false); return; }
+      const id = this.layoutId;
+      this.positionsReady = true;
+      this.sceneVersion++;
       for (const node of this.nodes) {
         if (node.pinned) continue;
         node.x = p[2 * node.idx];
         node.y = p[2 * node.idx + 1];
       }
-      if (done) {
-        this.layoutDone = true;
-        this._buildGrid();
-      }
+      if (this.nodes.length > 5000) {
+        await this._buildGridAsync();
+        if (id !== this.layoutId) return;
+      } else this._buildGrid();
+      this.layoutDone = done;
       if (!this.userMovedView) this.fitToView(false);
       this.onLayoutProgress(progress, done);
       if (done && this.centerUid && this.nodeMap.has(this.centerUid) && !this.selectedUid) {
@@ -305,11 +415,13 @@
     _gridLayout() {
       const n = this.nodes.length;
       const cols = Math.ceil(Math.sqrt(n));
-      const slot = 2 * Math.max(...this.nodes.map((nd) => nd.r)) + 12;
+      const slot = 2 * this.nodes.reduce((r, nd) => Math.max(r, nd.r), 0) + 12;
       this.keyboardOrder.forEach((node, i) => {
         node.x = (i % cols) * slot;
         node.y = Math.floor(i / cols) * slot;
       });
+      this.positionsReady = true;
+      this.sceneVersion++;
       this.layoutDone = true;
       this._buildGrid();
       this.fitToView(false);
@@ -355,6 +467,7 @@
       const k = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, this.k * factor));
       const wx = (sx - this.tx) / this.k;
       const wy = (sy - this.ty) / this.k;
+      this._deferDetail();
       this.k = k;
       this.tx = sx - wx * k;
       this.ty = sy - wy * k;
@@ -379,7 +492,11 @@
       if (!node) return;
       this.selectedUid = uid;
       this.selectedEdgeId = null;
-      this.highlight = new Set([uid, ...(this.adjacency.get(uid) || [])]);
+      this.highlight = new Set([uid]);
+      for (const e of this.edges) {
+        if (e.source === uid) this.highlight.add(e.target);
+        if (e.target === uid) this.highlight.add(e.source);
+      }
       this.keyboardIndex = this.keyboardOrder.indexOf(node);
       this.requestDraw();
       this.onNodeSelect(node);
@@ -405,7 +522,33 @@
     // ---------------------------------------------------------------- hit testing
 
     _buildGrid() {
+      const steps = this._buildGridSteps();
+      while (!steps.next().done) { /* synchronous fallback and rendering worker */ }
+    }
+
+    async _buildGridAsync() {
+      const id = this.layoutId, version = this.sceneVersion;
+      const steps = this._buildGridSteps();
+      for (;;) {
+        if (id !== this.layoutId || version !== this.sceneVersion) return;
+        const until = performance.now() + 8;
+        do { if (steps.next().done) return; } while (performance.now() < until);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+
+    *_buildGridSteps() {
       const maxR = this.nodes.reduce((m, n) => Math.max(m, n.r), 1);
+      this.maxRadius = maxR;
+      if (this.nodes.length > 5000) {
+        const nodes = new SpatialIndex(this.nodes, (n) => [n.x - n.r, n.y - n.r, n.x + n.r, n.y + n.r], true);
+        yield* nodes.steps;
+        const edges = new SpatialIndex(this.edges, (e) => [Math.min(e.s.x, e.t.x), Math.min(e.s.y, e.t.y),
+          Math.max(e.s.x, e.t.x), Math.max(e.s.y, e.t.y)], true);
+        yield* edges.steps;
+        this.nodeIndex = nodes; this.edgeIndex = edges; this.grid = null;
+        return;
+      }
       const cell = maxR * 2 + 8;
       const grid = new Map();
       for (const n of this.nodes) {
@@ -425,7 +568,9 @@
         const d = Math.hypot(n.x - wx, n.y - wy);
         if (d <= n.r + slack && d < bestD) { best = n; bestD = d; }
       };
-      if (this.grid && this.layoutDone) {
+      if (this.nodeIndex) {
+        this.nodeIndex.query(wx - slack, wy - slack, wx + slack, wy + slack).forEach(check);
+      } else if (this.grid && this.layoutDone && slack / this.grid.cell < 30) {
         const { cell, map } = this.grid;
         const gx = Math.floor(wx / cell), gy = Math.floor(wy / cell);
         const reach = Math.ceil(slack / cell) + 1;
@@ -446,7 +591,8 @@
       const wy = (sy - this.ty) / this.k;
       const maxD = 6 / this.k;
       let best = null, bestD = maxD;
-      for (const e of this.edges) {
+      const candidates = this.edgeIndex ? this.edgeIndex.query(wx - maxD, wy - maxD, wx + maxD, wy + maxD) : this.edges;
+      for (const e of candidates) {
         const x1 = e.s.x, y1 = e.s.y, x2 = e.t.x, y2 = e.t.y;
         if (wx < Math.min(x1, x2) - maxD || wx > Math.max(x1, x2) + maxD ||
             wy < Math.min(y1, y2) - maxD || wy > Math.max(y1, y2) + maxD) continue;
@@ -488,12 +634,15 @@
           drag.lastX = sx; drag.lastY = sy;
           if (!drag.moved) return;
           if (drag.mode === 'pan') {
+            this._deferDetail();
             this.tx += dx; this.ty += dy;
             this.userMovedView = true;
           } else {
             drag.node.x += dx / this.k;
             drag.node.y += dy / this.k;
             drag.node.pinned = true;
+            this.sceneVersion++;
+            this.nodeIndex = this.edgeIndex = null;
           }
           this.tooltip.hidden = true;
           this.requestDraw();
@@ -514,7 +663,7 @@
         drag = null;
         c.classList.remove('is-dragging-node', 'is-panning');
         if (c.hasPointerCapture(ev.pointerId)) c.releasePointerCapture(ev.pointerId);
-        if (d.mode === 'node' && d.moved) { this._buildGrid(); return; }
+        if (d.mode === 'node' && d.moved) { this._buildGridAsync(); return; }
         if (d.moved) return;
         const [sx, sy] = pos(ev);
         const node = d.node || (this.layoutDone ? this.nodeAt(sx, sy) : null);
@@ -600,12 +749,128 @@
       });
     }
 
+    _releaseFrame() {
+      if (this.frameCache?.canvas.close) this.frameCache.canvas.close();
+      this.frameCache = null;
+    }
+
+    _requestWorkerFrame() {
+      if (this.nodes.length <= 5000 || this.renderWorkerFailed || typeof OffscreenCanvas === 'undefined') return false;
+      if (this.renderBusy) return true;
+      if (!this.renderWorker) {
+        try {
+          this.renderWorker = new Worker(new URL('graph-render-worker.js', new URL(this.workerUrl, document.baseURI)));
+          this.renderVersion = -1;
+          const worker = this.renderWorker;
+          this.renderWorker.onerror = (event) => {
+            event.preventDefault();
+            if (worker !== this.renderWorker) return;
+            worker.terminate(); this.renderWorker = null;
+            this.renderBusy = false; this.renderWorkerFailed = true;
+            this.requestDraw();
+          };
+        } catch (err) { this.renderWorkerFailed = true; return false; }
+      }
+      const { width, height, dpr, k, tx, ty, sceneVersion: version, highlight } = this;
+      const request = { width, height, dpr, k, tx, ty, colors: this.colors, fontFamily: this.fontFamily,
+        selectedUid: this.selectedUid, selectedEdgeId: this.selectedEdgeId, highlight: highlight ? [...highlight] : null };
+      if (this.renderVersion !== version) {
+        request.nodes = this.nodes.map((n) => ({ idx: n.idx, uid: n.uid, x: n.x, y: n.y, r: n.r, type: n.type, state: n.state }));
+        request.edges = this.edges.map((e) => ({ source: e.source, target: e.target, kind: e.kind, _id: e._id, s: e.s.idx, t: e.t.idx }));
+        this.renderVersion = version;
+      }
+      this.renderBusy = true;
+      const worker = this.renderWorker;
+      this.renderWorker.onmessage = ({ data }) => {
+        if (worker !== this.renderWorker) { data.bitmap?.close(); return; }
+        this.renderBusy = false;
+        if (data.error) {
+          worker.terminate(); this.renderWorker = null; this.renderWorkerFailed = true;
+        } else if (version === this.sceneVersion) {
+          this._releaseFrame();
+          const margin = 40 / k;
+          const nodes = this.nodeIndex ? this.nodeIndex.query(-tx / k - margin, -ty / k - margin,
+            (width - tx) / k + margin, (height - ty) / k + margin) : this.nodes;
+          this.frameCache = { canvas: data.bitmap, version, width, height, dpr, k, tx, ty, highlight, nodes };
+        } else data.bitmap.close();
+        this.requestDraw();
+      };
+      try { worker.postMessage(request); }
+      catch (err) {
+        worker.terminate(); this.renderWorker = null;
+        this.renderBusy = false; this.renderWorkerFailed = true;
+        return false;
+      }
+      return true;
+    }
+
+    _notifyRenderReady() {
+      if (this.renderReadyVersion === this.sceneVersion) return;
+      this.renderReadyVersion = this.sceneVersion;
+      this.onRenderReady();
+    }
+
+    _deferDetail() {
+      if (this.nodes.length <= 5000) return;
+      this.viewInteracting = true;
+      clearTimeout(this.detailTimer);
+      this.detailTimer = setTimeout(() => { this.viewInteracting = false; this.requestDraw(); }, 100);
+    }
+
     _draw() {
-      const { ctx, width: w, height: h, dpr, k, tx, ty, colors } = this;
-      if (!w || !h) return;
+      const { ctx, width, height, dpr, k, tx, ty } = this;
+      if (!width || !height) return;
+      if (this.nodes.length && this.positionsReady === false) return;
+      // Large layouts settle quickly; do not queue an expensive rasterization of
+      // the temporary cluster positions ahead of the final frame.
+      if (this.nodes.length > 5000 && !this.layoutDone) return;
+      const cache = this.frameCache;
+      const valid = cache && cache.version === this.sceneVersion && cache.width === width &&
+        cache.height === height && cache.dpr === dpr && cache.highlight === this.highlight;
+      const sameView = valid && cache.k === k && cache.tx === tx && cache.ty === ty;
+      if (valid && (sameView || this.viewInteracting)) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        const scale = k / cache.k;
+        ctx.setTransform(scale, 0, 0, scale, (tx - cache.tx * scale) * dpr, (ty - cache.ty * scale) * dpr);
+        ctx.drawImage(cache.canvas, 0, 0);
+        // Labels and focus rings retain their original screen size while zooming.
+        this._drawDecorations(cache.nodes);
+        this._notifyRenderReady();
+        return;
+      }
+      if (this._requestWorkerFrame()) {
+        // Keep the last completed frame responsive while the next one rasterizes.
+        if (cache) {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+          const scale = k / cache.k;
+          ctx.setTransform(scale, 0, 0, scale, (tx - cache.tx * scale) * dpr, (ty - cache.ty * scale) * dpr);
+          ctx.drawImage(cache.canvas, 0, 0);
+          this._drawDecorations(cache.nodes);
+        }
+        return;
+      }
+      const visibleNodes = this._drawScene();
+      if (this.nodes.length > 5000) {
+        const canvas = cache && !cache.canvas.close ? cache.canvas : document.createElement('canvas');
+        if (cache?.canvas.close) cache.canvas.close();
+        canvas.width = this.canvas.width; canvas.height = this.canvas.height;
+        canvas.getContext('2d').drawImage(this.canvas, 0, 0);
+        this.frameCache = { canvas, version: this.sceneVersion, width, height, dpr, k, tx, ty,
+          highlight: this.highlight, nodes: visibleNodes };
+      }
+      this._drawDecorations(visibleNodes);
+      this._notifyRenderReady();
+    }
+
+    _drawScene() {
+      const { width: w, height: h, dpr, k, tx, ty, colors } = this;
+      let ctx = this.ctx;
+      if (!w || !h) return [];
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
-      if (!this.nodes.length) return;
+      if (!this.nodes.length) return [];
 
       // visible world rectangle (+ margin)
       const margin = 40 / k;
@@ -616,10 +881,37 @@
       ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
       const hl = this.highlight;
 
+      // Composite each style once at its original opacity. Bounded paths avoid
+      // pathological Canvas tessellation without darkening overlapping edges.
+      const layered = this.nodes.length > 5000;
+      const beginStyle = (alpha) => {
+        if (!layered) { ctx.globalAlpha = alpha; return; }
+        const canvas = this.styleCanvas || (this.styleCanvas = typeof document === 'undefined' ?
+          new OffscreenCanvas(this.canvas.width, this.canvas.height) : document.createElement('canvas'));
+        if (canvas.width !== this.canvas.width || canvas.height !== this.canvas.height) {
+          canvas.width = this.canvas.width; canvas.height = this.canvas.height;
+        }
+        ctx = canvas.getContext('2d');
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+        ctx.globalAlpha = 1;
+        this.ctx.globalAlpha = alpha;
+      };
+      const endStyle = () => {
+        if (!layered) return;
+        this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        this.ctx.drawImage(this.styleCanvas, 0, 0);
+        this.ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+        this.ctx.globalAlpha = 1;
+        ctx = this.ctx;
+      };
+
       // ---- edges, batched per style (and per dimmed/highlighted)
       const groups = new Map();
       let visibleEdges = 0;
-      for (const e of this.edges) {
+      const edgeCandidates = this.edgeIndex ? this.edgeIndex.query(vx0, vy0, vx1, vy1) : this.edges;
+      for (const e of edgeCandidates) {
         const { s, t } = e;
         if (Math.max(s.x, t.x) < vx0 || Math.min(s.x, t.x) > vx1 || Math.max(s.y, t.y) < vy0 || Math.min(s.y, t.y) > vy1) continue;
         visibleEdges++;
@@ -639,14 +931,16 @@
         const style = EDGE_STYLES[kind] || EDGE_STYLES.links_to;
         const color = colors[style.color] || colors.muted;
         const active = activeFlag === '1';
-        ctx.globalAlpha = hl ? (active ? 1 : 0.08) : 0.55;
+        beginStyle(hl ? (active ? 1 : 0.08) : 0.55);
         ctx.strokeStyle = color;
         ctx.fillStyle = color;
         ctx.lineWidth = ((active && hl) ? style.width + 1 : style.width) / k;
         ctx.setLineDash(detailed ? style.dash.map((d) => d / k) : []);
         ctx.beginPath();
         const list = groups.get(key);
+        let batch = 0;
         for (const e of list) {
+          if (layered && ++batch % 256 === 0) { ctx.stroke(); ctx.beginPath(); }
           const { s, t } = e;
           const dx = t.x - s.x, dy = t.y - s.y;
           const len = Math.hypot(dx, dy) || 1;
@@ -672,6 +966,7 @@
           }
           ctx.fill();
         }
+        endStyle();
       }
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
@@ -679,7 +974,8 @@
       // ---- nodes, batched by visual style
       const nodeGroups = new Map();
       const visibleNodes = [];
-      for (const n of this.nodes) {
+      const nodeCandidates = this.nodeIndex ? this.nodeIndex.query(vx0, vy0, vx1, vy1) : this.nodes;
+      for (const n of nodeCandidates) {
         if (!visible(n)) continue;
         visibleNodes.push(n);
         const dim = hl && !hl.has(n.uid);
@@ -691,28 +987,60 @@
       for (const [key, list] of nodeGroups) {
         const [type, status, dimFlag] = key.split('|');
         const base = type === 'jira' ? colors.jira : colors.confluence;
-        ctx.globalAlpha = dimFlag === '1' ? 0.15 : 1;
+        beginStyle(dimFlag === '1' ? 0.15 : 1);
         ctx.beginPath();
-        for (const n of list) this._shapePath(n, type);
+        // Bounded paths avoid quadratic tessellation work in Canvas implementations.
+        const paint = (method) => {
+          ctx.beginPath();
+          for (let i = 0; i < list.length; i++) {
+            this._shapePath(list[i], type, ctx);
+            if (layered && i % 256 === 255) { ctx[method](); ctx.beginPath(); }
+          }
+          ctx[method]();
+        };
         if (status === 'ok') {
           ctx.fillStyle = base;
-          ctx.fill();
+          paint('fill');
           ctx.lineWidth = 1.5 / k;
           ctx.strokeStyle = colors.surface;
           ctx.setLineDash([]);
-          ctx.stroke();
+          paint('stroke');
         } else {
           ctx.fillStyle = colors.surface;
-          ctx.fill();
+          paint('fill');
           ctx.lineWidth = 1.6 / k;
           ctx.strokeStyle = status === 'error' ? colors.danger : colors.muted;
           ctx.setLineDash([3 / k, 2.5 / k]);
-          ctx.stroke();
+          paint('stroke');
           ctx.setLineDash([]);
         }
+        endStyle();
       }
       ctx.globalAlpha = 1;
 
+      // ---- glyphs (only when big enough to read)
+      if (k * 7 >= 6) {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.font = `600 ${Math.min(14, Math.max(9, k * 9))}px ${this.fontFamily}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        for (const n of visibleNodes) {
+          if (n.state !== 'indexed' || n.r * k < 8) continue;
+          ctx.globalAlpha = hl && !hl.has(n.uid) ? 0.2 : 1;
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(n.type === 'jira' ? 'J' : 'C', n.x * k + tx, n.y * k + ty + 0.5);
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      return visibleNodes;
+    }
+
+    _drawDecorations(visibleNodes) {
+      const { ctx, colors, k, tx, ty, dpr } = this;
+      const visible = (n) => n.x * k + tx + n.r * k >= 0 && n.x * k + tx - n.r * k <= this.width &&
+        n.y * k + ty + n.r * k >= 0 && n.y * k + ty - n.r * k <= this.height;
+      ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
       // ---- rings for center / selected / hovered
       const ring = (n, color, width, gap) => {
         if (!n || !visible(n)) return;
@@ -726,26 +1054,10 @@
       ring(this.nodeMap.get(this.selectedUid), colors.focus, 3, 3);
       ring(this.hoverNode, colors.focus, 1.5, 3);
 
-      // ---- glyphs (only when big enough to read)
-      if (k * 7 >= 6) {
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.font = `600 ${Math.min(14, Math.max(9, k * 9))}px ${cssVar('--font-sans', 'sans-serif')}`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        for (const n of visibleNodes) {
-          if (n.state !== 'indexed' || n.r * k < 8) continue;
-          ctx.globalAlpha = hl && !hl.has(n.uid) ? 0.2 : 1;
-          ctx.fillStyle = '#ffffff';
-          ctx.fillText(n.type === 'jira' ? 'J' : 'C', n.x * k + tx, n.y * k + ty + 0.5);
-        }
-        ctx.globalAlpha = 1;
-      }
-
       this._drawLabels(visibleNodes);
     }
 
-    _shapePath(n, type) {
-      const { ctx } = this;
+    _shapePath(n, type, ctx = this.ctx) {
       if (type === 'jira') {
         const r = n.r * 0.92, x = n.x - r, y = n.y - r, s = 2 * r, c = r * 0.35;
         ctx.moveTo(x + c, y);
@@ -772,11 +1084,15 @@
         return 4;
       };
       // Only nodes that are large enough on screen get labels, except important ones.
-      const candidates = visibleNodes.filter((n) => prio(n) < 4 || n.r * k >= 5);
+      const labelNodes = this.maxRadius * k < 2 ?
+        [...new Set([this.nodeMap.get(this.selectedUid), this.hoverNode, this.nodeMap.get(this.centerUid),
+          ...(hl ? [...hl].map((uid) => this.nodeMap.get(uid)) : [])])].filter(Boolean) : visibleNodes;
+      const candidates = labelNodes.filter((n) => prio(n) < 4 || n.r * k >= 5);
       candidates.sort((a, b) => prio(a) - prio(b) || (b.degree || 0) - (a.degree || 0) || (a.uid < b.uid ? -1 : 1));
 
+      if (!candidates.length) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.font = `${LABEL_FONT_PX}px ${cssVar('--font-sans', 'sans-serif')}`;
+      ctx.font = `${LABEL_FONT_PX}px ${this.fontFamily}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       ctx.lineJoin = 'round';
@@ -792,7 +1108,7 @@
         }
       };
       // Node bodies are obstacles too, so labels never cover other nodes.
-      for (const n of visibleNodes) {
+      for (const n of this.maxRadius * k < 2 ? [] : visibleNodes) {
         const sx = n.x * k + tx, sy = n.y * k + ty, r = n.r * k;
         if (r >= 2) reserve([sx - r, sy - r, sx + r, sy + r, n.uid]);
       }
@@ -802,7 +1118,7 @@
         if (count >= MAX_LABELS) break;
         const sx = n.x * k + tx;
         const sy = n.y * k + ty + n.r * k + 3;
-        const width = ctx.measureText(n.label).width;
+        const width = n.labelWidth ?? (n.labelWidth = ctx.measureText(n.label).width);
         const rect = [sx - width / 2 - 2, sy - 1, sx + width / 2 + 2, sy + LABEL_FONT_PX + 2];
         // ignore the node's own body when checking
         let hit = false;

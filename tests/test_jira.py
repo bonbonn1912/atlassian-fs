@@ -73,6 +73,8 @@ class TestJiraClient(unittest.TestCase):
 
         self.assertEqual(doc.uid, "jira:PROJ-101")
         self.assertEqual(doc.title, "PROJ-101: Implement Knowledge Graph Service")
+        self.assertEqual(doc.source_created_at, "2026-03-01T09:00:00.000+0100")
+        self.assertEqual(doc.source_updated_at, "2026-03-10T14:30:00.000+0100")
         self.assertIn("Status: In Progress", doc.body_text)
         self.assertEqual(doc.space_or_project, "PROJ")
         self.assertEqual(doc.document_type, "Story")
@@ -159,6 +161,8 @@ class TestJiraClient(unittest.TestCase):
 
         self.assertEqual(doc.uid, "jira:CLOUD-10")
         self.assertEqual(doc.title, "CLOUD-10: Cloud Migrations")
+        self.assertEqual(doc.source_created_at, "2026-04-01T08:00:00.000Z")
+        self.assertEqual(doc.source_updated_at, "2026-04-02T10:00:00.000Z")
         self.assertEqual(doc.document_type, "Task")
         self.assertEqual(doc.status_label, "To Do")
         self.assertIn("Migration details in ADF", doc.body_text)
@@ -265,6 +269,9 @@ class TestJiraClient(unittest.TestCase):
         self.assertEqual(doc.uid, "jira:NEW-202")
         self.assertEqual(doc.source_id, "NEW-202")
         self.assertEqual(doc.space_or_project, "NEW")
+        # Dates missing from fields must be None (not manufactured)
+        self.assertIsNone(doc.source_created_at)
+        self.assertIsNone(doc.source_updated_at)
 
 
 if __name__ == "__main__":

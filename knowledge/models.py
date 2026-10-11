@@ -140,6 +140,7 @@ class FetchedDocument:
     source_version: str | None = None
     source_updated_at: str | None = None
     labels: list[str] = field(default_factory=list)
+    source_created_at: str | None = None
 
     def content_hash(self) -> str:
         h = hashlib.sha256()

@@ -41,8 +41,8 @@
     }
   }
 
-  async function api(method, path, body) {
-    const opts = { method, headers: { Accept: 'application/json' } };
+  async function api(method, path, body, signal) {
+    const opts = { method, headers: { Accept: 'application/json' }, signal };
     if (body !== undefined) {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
@@ -51,6 +51,7 @@
     try {
       res = await fetch(path, opts);
     } catch (err) {
+      if (err.name === 'AbortError') throw err;
       throw new ApiError('Server nicht erreichbar. Läuft „python app.py serve“?', 0, 'network');
     }
     let data = null;
@@ -126,7 +127,15 @@
     job: null,
     pollTimer: null,
     graph: null,
+    graph2d: null,
+    flightGraph: null,
+    graphData: null,
+    graphFlight: false,
+    timelineAxis: false,
+    graphImportance: false,
+    graphViewGeneration: 0,
     graphLoadedKey: null,
+    graphRequest: null,
     settings: null,
     spaces: null,        // /api/spaces
     spacesFetchedAt: null,
@@ -170,6 +179,7 @@
       panel.classList.toggle('active', active);
     }
     fitGraphViewport();
+    if (state.flightGraph) state.flightGraph.setActive(tab === 'graph' && state.graphFlight);
   }
 
   function onRoute() {
@@ -813,16 +823,19 @@
       onNodeActivate: (node) => setHash('graph', { focus: node.uid }),
       onEdgeSelect: (edge) => inspectEdge(edge),
       onLayoutProgress: (progress, done) => {
+        if (state.graph !== state.graph2d) return;
         const overlay = $('graph-loading-overlay');
         overlay.hidden = done || state.graph.nodes.length < 400 || progress > 0;
         $('graph-loading-text').textContent = `Layout wird berechnet … ${Math.round(progress * 100)} %`;
         const banner = $('graph-layout-progress');
         if (banner) {
-          banner.hidden = done;
-          banner.textContent = `Layout ${Math.round(progress * 100)} % – ${fmtNum(state.graph.nodes.length)} Knoten`;
+          banner.hidden = done && state.graph.nodes.length <= 5000;
+          banner.textContent = done && state.graph.nodes.length > 5000 ? `Graph wird gezeichnet … ${fmtNum(state.graph.nodes.length)} Knoten` : `Layout ${Math.round(progress * 100)} % – ${fmtNum(state.graph.nodes.length)} Knoten`;
         }
       },
+      onRenderReady: () => { if (state.graph === state.graph2d && state.graph.layoutDone) $('graph-layout-progress').hidden = true; },
     });
+    state.graph2d = state.graph;
     $('graph-canvas-container').appendChild(el('div', {
       className: 'graph-layout-progress', attrs: { id: 'graph-layout-progress', 'aria-live': 'polite', hidden: true },
     }));
@@ -865,7 +878,8 @@
     const impBtn = $('graph-importance-btn');
     if (impBtn) {
       impBtn.addEventListener('click', () => {
-        const next = !state.graph.importanceMode;
+        const next = !state.graphImportance;
+        state.graphImportance = next;
         state.graph.setImportanceMode(next);
         impBtn.setAttribute('aria-pressed', next ? 'true' : 'false');
         impBtn.classList.toggle('active', next);
@@ -874,6 +888,20 @@
           : 'Knoten nach Wichtigkeit (eingehende Links) skalieren und zentral anordnen';
       });
     }
+
+    $('graph-flight-btn').addEventListener('click', () => setGraphFlight(!state.graphFlight));
+    const timelineBtn = $('graph-timeline-btn');
+    if (timelineBtn) {
+      timelineBtn.addEventListener('click', () => {
+        state.timelineAxis = !state.timelineAxis;
+        timelineBtn.setAttribute('aria-pressed', String(state.timelineAxis));
+        timelineBtn.classList.toggle('active', state.timelineAxis);
+        if (state.flightGraph) state.flightGraph.setTimelineAxis(state.timelineAxis);
+      });
+    }
+    $('graph-flight-jira-time').addEventListener('change', () => {
+      if (state.flightGraph) state.flightGraph.setJiraTimeField($('graph-flight-jira-time').value);
+    });
 
     $('graph-zoom-in').addEventListener('click', () => state.graph.zoomIn());
     $('graph-zoom-out').addEventListener('click', () => state.graph.zoomOut());
@@ -884,6 +912,91 @@
       $('inspector-empty-state').hidden = false;
       $('inspector-title').textContent = 'Inspektor';
     });
+  }
+
+  async function loadActiveGraphData() {
+    const graph = state.graph;
+    if (!state.graphData || graph.loadedData === state.graphData) return;
+    const data = state.graphData;
+    graph.loadedData = data;
+    try { await graph.setData(data, data.center || null); }
+    catch (err) { if (graph.loadedData === data) graph.loadedData = null; throw err; }
+  }
+
+  async function setGraphFlight(enabled) {
+    const generation = ++state.graphViewGeneration;
+    if (enabled && !state.flightGraph) {
+      try {
+        state.flightGraph = new window.KnowledgeGraphFlight({
+          canvasEl: $('graph-flight-canvas'), containerEl: $('graph-flight-container'),
+          onNodeSelect: (node) => { if (state.graphFlight) inspectNode(node.uid); },
+          onNodeActivate: (node) => { if (state.graphFlight) setHash('graph', { focus: node.uid }); },
+          onEdgeSelect: (edge) => { if (state.graphFlight) inspectEdge(edge); },
+          onStatus: (status) => {
+            if (!state.graphFlight) return;
+            $('graph-flight-status').textContent = status.message || (status.loading ? '3D-Fluglayout wird berechnet …' : 'Bereit zum Fliegen');
+            if (status.unknownCount !== undefined) {
+              const unknown = $('graph-flight-unknown');
+              unknown.hidden = !status.unknownCount;
+              unknown.textContent = `${fmtNum(status.unknownCount)} Einträge ohne Datum – separate Ebene vor der Zeitachse. Bereits indexierte Tickets erhalten ihr Erstellungsdatum beim nächsten Aktualisieren.`;
+            }
+            if (state.flightGraph?.supported === false) {
+              setGraphFlight(false);
+              showGraphBanner(status.message || '3D ist hier nicht verfügbar. Die 2D-Ansicht bleibt nutzbar.');
+            }
+          },
+        });
+      } catch (err) {
+        showGraphBanner(`3D konnte nicht gestartet werden: ${err.message}. Die 2D-Ansicht bleibt nutzbar.`);
+        return;
+      }
+    }
+    if (enabled && !state.flightGraph.supported) {
+      showGraphBanner('Dieser Browser unterstützt die 3D-Ansicht nicht. Die 2D-Ansicht bleibt nutzbar.');
+      return;
+    }
+    state.graphFlight = enabled;
+    state.graph = enabled ? state.flightGraph : state.graph2d;
+    $('graph-canvas').hidden = enabled;
+    $('graph-flight-container').hidden = !enabled;
+    $('graph-legend').hidden = enabled;
+    $('graph-flight-hud').hidden = !enabled;
+    $('graph-flight-help').hidden = !enabled;
+    if ($('graph-timeline-btn')) $('graph-timeline-btn').hidden = !enabled;
+    $('graph-flight-time-control').hidden = !enabled;
+    $('graph-layout-progress').hidden = true;
+    const button = $('graph-flight-btn');
+    button.setAttribute('aria-pressed', String(enabled));
+    button.classList.toggle('active', enabled);
+    const tBtn = $('graph-timeline-btn');
+    if (tBtn) {
+      tBtn.setAttribute('aria-pressed', String(state.timelineAxis));
+      tBtn.classList.toggle('active', state.timelineAxis);
+    }
+    $('graph-zoom-in').title = enabled ? 'Vorwärts in den Raum' : 'Vergrößern (+)';
+    $('graph-zoom-in').setAttribute('aria-label', enabled ? 'Vorwärts fliegen' : 'Vergrößern');
+    $('graph-zoom-out').title = enabled ? 'Zurück zum Eingang' : 'Verkleinern (−)';
+    $('graph-zoom-out').setAttribute('aria-label', enabled ? 'Rückwärts fliegen' : 'Verkleinern');
+    $('graph-fit-btn').textContent = enabled ? 'Startposition' : 'Zentrieren';
+    if (state.flightGraph) {
+      state.flightGraph.setActive(enabled && state.currentTab === 'graph');
+      if (enabled) {
+        state.flightGraph.setJiraTimeField($('graph-flight-jira-time').value);
+        state.flightGraph.setTimelineAxis(state.timelineAxis);
+      }
+    }
+    if (state.graph.importanceMode !== state.graphImportance) state.graph.setImportanceMode(state.graphImportance);
+    fitGraphViewport();
+    try {
+      await loadActiveGraphData();
+      if (generation !== state.graphViewGeneration) return;
+      if (!enabled) { state.graph2d._resize(); state.graph2d.requestDraw(); }
+      (enabled ? $('graph-flight-canvas') : $('graph-canvas')).focus({ preventScroll: true });
+    } catch (err) {
+      if (generation !== state.graphViewGeneration) return;
+      if (enabled) await setGraphFlight(false);
+      showGraphBanner(`Graph konnte nicht dargestellt werden: ${err.message}`);
+    }
   }
 
   function selectedEdgeKinds() {
@@ -911,14 +1024,22 @@
     const key = qs.toString();
     if (state.graphLoadedKey === key) return;
     state.graphLoadedKey = key;
+    if (state.graphRequest) state.graphRequest.abort();
+    const request = new AbortController();
+    state.graphRequest = request;
+    // Cancel both old layout work and a sliced data preparation still in flight.
+    state.graph.cancelPending();
+    state.graph.loadedData = null;
     $('graph-loading-overlay').hidden = false;
     showGraphBanner('');
     try {
-      const data = await api('GET', `/api/graph?${qs}`);
-      // Wait one frame so the now-visible SVG has its real size for layout/fit.
+      const data = await api('GET', `/api/graph?${qs}`, undefined, request.signal);
+      // Wait one frame so the now-visible canvas has its real size for layout/fit.
       await new Promise((r) => requestAnimationFrame(r));
-      $('graph-loading-overlay').hidden = true;
-      state.graph.setData(data, data.center || null);
+      if (request !== state.graphRequest) return;
+      state.graphData = data;
+      await loadActiveGraphData();
+      if (request !== state.graphRequest) return;
       const impBtn = $('graph-importance-btn');
       if (impBtn) {
         impBtn.setAttribute('aria-pressed', state.graph.importanceMode ? 'true' : 'false');
@@ -934,11 +1055,13 @@
         $('inspector-empty-state').hidden = false;
       }
     } catch (err) {
+      if (request !== state.graphRequest || err.name === 'AbortError') return;
       state.graphLoadedKey = null;
-      state.graph.setData({ nodes: [], edges: [] }, null);
+      state.graphData = { nodes: [], edges: [] };
+      await loadActiveGraphData();
       showGraphBanner(err.status === 404 ? `Knoten „${focus}“ ist lokal nicht bekannt.` : `Graph konnte nicht geladen werden: ${err.message}`);
     } finally {
-      $('graph-loading-overlay').hidden = true;
+      if (request === state.graphRequest) $('graph-loading-overlay').hidden = true;
     }
   }
 
@@ -998,8 +1121,11 @@
     }
     if (seq !== inspectSeq) return;
     clear(details);
-    $('inspector-title').textContent = TYPE_LABEL[doc.source_type] || 'Dokument';
-    details.appendChild(el('span', { className: `result-badge badge-${doc.source_type} inspector-type-badge`, text: TYPE_LABEL[doc.source_type] }));
+    const docType = doc.type || doc.source_type || (doc.uid?.startsWith('jira:') ? 'jira' : 'confluence');
+    const projectOrSpace = doc.project || doc.space_or_project || doc.space;
+    const statusLabel = doc.status || doc.status_label;
+    $('inspector-title').textContent = TYPE_LABEL[docType] || 'Dokument';
+    details.appendChild(el('span', { className: `result-badge badge-${docType} inspector-type-badge`, text: TYPE_LABEL[docType] }));
     details.appendChild(el('div', { className: 'inspector-doc-title', text: doc.title || doc.uid }));
     const actions = el('div', { className: 'inspector-actions-row' });
     if (doc.url) {
@@ -1013,11 +1139,12 @@
     const props = el('div', { className: 'inspector-props-list' }, [
       prop('UID', doc.uid),
       prop('Zustand', STATE_LABEL[doc.state] || doc.state),
-      prop(doc.source_type === 'jira' ? 'Projekt' : 'Space', doc.space_or_project),
+      prop(docType === 'jira' ? 'Projekt' : 'Space', projectOrSpace),
       prop('Typ', doc.document_type),
-      prop('Status', doc.status_label),
+      prop('Status', statusLabel),
       prop('Labels', (doc.labels || []).join(', ')),
-      prop('Aktualisiert', formatDate(doc.source_updated_at)),
+      prop('Erstellt', doc.source_created_at ? formatDate(doc.source_created_at) : null),
+      prop('Aktualisiert', formatDate(doc.source_updated_at || doc.updated_at)),
       prop('Abgerufen', formatDate(doc.fetched_at)),
       prop('Letzter Fehler', doc.last_error),
     ].filter(Boolean));

@@ -8,17 +8,26 @@ from typing import Any, Iterable, Sequence
 logger = logging.getLogger(__name__)
 
 # Hard upper bound for a single subgraph response (the frontend renders on canvas).
-MAX_SUBGRAPH_NODES = 20000
+MAX_SUBGRAPH_NODES = 100_000
 # Stay well below SQLite's bound-parameter limit when using IN (...) lists.
 _SQL_CHUNK = 500
 
 _NODE_COLUMNS = ("id, uid, source_type, title, url, state, space_or_project, "
-                 "document_type, status_label")
+                 "document_type, status_label, source_created_at, source_updated_at")
 
 
 def _chunks(items: Sequence[int], size: int = _SQL_CHUNK) -> Iterable[Sequence[int]]:
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+def _get_field(row: sqlite3.Row | dict[str, Any], key: str) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
 
 
 def _make_node_dict(
@@ -35,6 +44,8 @@ def _make_node_dict(
         "url": doc_row["url"],
         "state": doc_row["state"],
         "project": doc_row["space_or_project"],
+        "source_created_at": _get_field(doc_row, "source_created_at"),
+        "source_updated_at": _get_field(doc_row, "source_updated_at"),
         "document_type": doc_row["document_type"],
         "status": doc_row["status_label"],
         "degree": degree,
@@ -218,7 +229,7 @@ def get_document_detail(
         """
         SELECT id, uid, source_type, source_id, title, url, space_or_project,
                status_label, document_type, body_text, source_version,
-               source_updated_at, state, fetched_at, last_error, labels
+               source_created_at, source_updated_at, state, fetched_at, last_error, labels
         FROM documents WHERE uid = ?
         """,
         (uid,),
@@ -240,7 +251,7 @@ def get_document_detail(
     out_sql = """
         SELECT e.id, e.kind, e.relation_label, e.source_field, e.anchor_text, e.evidence_url,
                t.uid, t.source_type, t.title, t.url, t.state, t.space_or_project,
-               t.document_type, t.status_label
+               t.document_type, t.status_label, t.source_created_at, t.source_updated_at
         FROM edges e
         JOIN documents t ON t.id = e.target_doc
         WHERE e.source_doc = ?
@@ -263,6 +274,8 @@ def get_document_detail(
                 "url": r["url"],
                 "state": r["state"],
                 "project": r["space_or_project"],
+                "source_created_at": r["source_created_at"],
+                "source_updated_at": r["source_updated_at"],
                 "document_type": r["document_type"],
                 "status": r["status_label"],
             },
@@ -274,7 +287,7 @@ def get_document_detail(
     in_sql = """
         SELECT e.id, e.kind, e.relation_label, e.source_field, e.anchor_text, e.evidence_url,
                s.uid, s.source_type, s.title, s.url, s.state, s.space_or_project,
-               s.document_type, s.status_label
+               s.document_type, s.status_label, s.source_created_at, s.source_updated_at
         FROM edges e
         JOIN documents s ON s.id = e.source_doc
         WHERE e.target_doc = ?
@@ -297,6 +310,8 @@ def get_document_detail(
                 "url": r["url"],
                 "state": r["state"],
                 "project": r["space_or_project"],
+                "source_created_at": r["source_created_at"],
+                "source_updated_at": r["source_updated_at"],
                 "document_type": r["document_type"],
                 "status": r["status_label"],
             },
@@ -314,6 +329,8 @@ def get_document_detail(
         "status": row["status_label"],
         "document_type": row["document_type"],
         "source_version": row["source_version"],
+        "source_created_at": row["source_created_at"],
+        "source_updated_at": row["source_updated_at"],
         "updated_at": row["source_updated_at"],
         "state": row["state"],
         "fetched_at": row["fetched_at"],
@@ -335,16 +352,16 @@ def get_neighbors(
     direction: str = "both",
     limit: int = 50,
 ) -> dict | None:
-    """Return incoming and/or outgoing neighbors for a document node.
+    """Return paginated incoming and/or outgoing edges for a specific document node.
 
     Args:
         conn: sqlite3 connection
         uid: document UID
         direction: 'both', 'in', or 'out'
-        limit: maximum number of neighbors returned (max 200)
+        limit: max edges returned per direction (1..200)
 
     Returns:
-        dict with uid, direction, outgoing, incoming, and total; or None if not found.
+        dict with uid, direction, outgoing, incoming, and total; or None if uid not found.
     """
     if direction not in ("both", "in", "out"):
         raise ValueError(f"Invalid direction: {direction!r}; must be one of 'both', 'in', 'out'")
@@ -363,7 +380,7 @@ def get_neighbors(
         out_sql = """
             SELECT e.id, e.kind, e.relation_label, e.source_field, e.anchor_text, e.evidence_url,
                    t.uid, t.source_type, t.title, t.url, t.state, t.space_or_project,
-                   t.document_type, t.status_label
+                   t.document_type, t.status_label, t.source_created_at, t.source_updated_at
             FROM edges e
             JOIN documents t ON t.id = e.target_doc
             WHERE e.source_doc = ?
@@ -387,6 +404,8 @@ def get_neighbors(
                     "url": r["url"],
                     "state": r["state"],
                     "project": r["space_or_project"],
+                    "source_created_at": r["source_created_at"],
+                    "source_updated_at": r["source_updated_at"],
                     "document_type": r["document_type"],
                     "status": r["status_label"],
                 },
@@ -398,7 +417,7 @@ def get_neighbors(
             in_sql = """
                 SELECT e.id, e.kind, e.relation_label, e.source_field, e.anchor_text, e.evidence_url,
                        s.uid, s.source_type, s.title, s.url, s.state, s.space_or_project,
-                       s.document_type, s.status_label
+                       s.document_type, s.status_label, s.source_created_at, s.source_updated_at
                 FROM edges e
                 JOIN documents s ON s.id = e.source_doc
                 WHERE e.target_doc = ?
@@ -422,6 +441,8 @@ def get_neighbors(
                         "url": r["url"],
                         "state": r["state"],
                         "project": r["space_or_project"],
+                        "source_created_at": r["source_created_at"],
+                        "source_updated_at": r["source_updated_at"],
                         "document_type": r["document_type"],
                         "status": r["status_label"],
                     },
@@ -515,7 +536,7 @@ def find_related(
     cand_p = ",".join("?" for _ in cand_ids)
     docs_sql = f"""
         SELECT id, uid, source_type, title, url, state, space_or_project,
-               document_type, status_label
+               document_type, status_label, source_created_at, source_updated_at
         FROM documents
         WHERE id IN ({cand_p})
     """
@@ -535,6 +556,8 @@ def find_related(
             "url": d["url"],
             "state": d["state"],
             "project": d["space_or_project"],
+            "source_created_at": d["source_created_at"],
+            "source_updated_at": d["source_updated_at"],
             "document_type": d["document_type"],
             "status": d["status_label"],
             "score": score,
@@ -605,6 +628,7 @@ def get_top_documents(
     sql = f"""
         SELECT d.id, d.uid, d.source_type, d.source_id, d.title, d.url,
                d.space_or_project, d.document_type, d.status_label, d.state,
+               d.source_created_at, d.source_updated_at,
                COALESCE(inc.cnt, 0) AS incoming_count,
                COALESCE(outg.cnt, 0) AS outgoing_count
         FROM documents d
@@ -634,6 +658,8 @@ def get_top_documents(
             "title": r["title"],
             "url": r["url"],
             "project": r["space_or_project"],
+            "source_created_at": r["source_created_at"],
+            "source_updated_at": r["source_updated_at"],
             "document_type": r["document_type"],
             "status": r["status_label"],
             "state": r["state"],

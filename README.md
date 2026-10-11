@@ -85,6 +85,41 @@ Starten Sie über den Reiter **Indexierung** einen Crawl:
 - **Top-Dokumente:** Rangliste der wichtigsten Dokumente (ein-/ausgehende Kanten); per Klick direkt
   in Suche oder Graph springen (`GET /api/top-documents?types=&limit=&offset=&project=&q=`).
 
+Für große Graphen lässt sich unter **Einstellungen → Max. sichtbare Knoten im Graph**
+`graph.max_visible_nodes` bis auf **100000** erhöhen (Standard bleibt 5000).
+Die Graph-Werkzeugleiste übernimmt diese Obergrenze nach dem Neuladen der Seite.
+Ab 5001 Knoten wird ein mehrstufiges Layout verwendet: verbundene Gruppen werden
+angeordnet und anschließend in sämtliche Einzelknoten aufgelöst. Die Positionen
+ändern sich dadurch; Farben, Formen, Kantenstile und Bedienung bleiben erhalten.
+Kein angeforderter Knoten wird für die Darstellung stichprobenartig entfernt.
+
+Große Ansichten werden mit OffscreenCanvas in einem Worker gezeichnet. Räumliche
+Indizes begrenzen die Arbeit beim Hineinzoomen; während Zoom/Pan wird das letzte
+Bild bewegt und anschließend scharf nachgezeichnet. Ohne OffscreenCanvas bleibt
+der Canvas-Fallback verfügbar, beansprucht aber den UI-Thread. Große Graph-Antworten
+werden bei entsprechender Browser-Unterstützung mit gzip übertragen. Die tatsächliche
+Ladezeit hängt zusätzlich von Kantenzahl, Datenbank, Hardware und Verbindung ab.
+
+**3D-Zeitflug:** Der zusätzliche Schalter neben dem Wichtigkeits-Modus öffnet eine
+räumliche Ansicht. Confluence-Seiten werden nach Space gruppiert, verknüpfte
+Jira-Tickets dem am stärksten verbundenen Space zugeordnet. Tickets ohne
+Confluence-Verbindung bilden eigene Jira-Projekt-Cluster. Die neueren Inhalte
+liegen vorne, die älteren weiter hinten im Raum. Confluence verwendet immer die
+letzte Änderung; über **Jira-Zeitachse** lassen sich **Erstellt am** oder **Letzte
+Änderung** wählen. Über **Zeitachse** lässt sich eine durchgehende Achse mit gut
+sichtbaren Jahres- und Monatsmarkierungen entlang der Zeitrichtung einblenden (standardmäßig ausgeschaltet).
+Fehlende Datumswerte erscheinen in einer separaten Ebene vor
+der Zeitachse und werden nicht als alte Einträge ausgegeben. Das Erstellungsdatum
+bereits indexierter Tickets wird beim nächsten erneuten Abruf ergänzt.
+
+Im fokussierten Raum: ziehen zum Umsehen, Mausrad oder W/S zum Fliegen, A/D
+seitwärts und Q/E vertikal. Beim Vorbeiflug werden die Titel nahegelegener Objekte
+automatisch eingeblendet (maximal ~8 im Blickfeld, ohne Klick). **Startposition**
+setzt die Kamera zurück. Klick öffnet
+den bestehenden Inspektor, Doppelklick lädt das Objekt als Graph-Zentrum. Der
+Wichtigkeits-Modus bleibt zusätzlich verwendbar. Die Flugansicht benötigt WebGL;
+falls es nicht verfügbar ist, bleibt die 2D-Ansicht nutzbar.
+
 ### 8. Spaces auswählen & geänderte Seiten nachziehen
 
 Im Reiter **Einstellungen** gibt es den Abschnitt **Confluence-Spaces & Aktualisierung**:
@@ -254,3 +289,30 @@ python3 -m unittest discover tests -v
 # Spezifisch den Webserver testen
 python3 -m unittest tests.test_webserver -v
 ```
+
+Die JavaScript-Regressionstests benötigen Node.js (nur eingebaute Module):
+
+```bash
+node --test tests/graph.test.cjs
+```
+
+Reproduzierbarer Browser-Benchmark mit **100000 Knoten und 199998 Kanten**:
+
+```bash
+python3 -m http.server 8766 --bind 127.0.0.1
+# http://127.0.0.1:8766/tests/graph-benchmark.html?nodes=100000
+# Mit &fallback=1 lässt sich der Canvas-Fallback prüfen.
+```
+
+Der Benchmark misst Datenaufbereitung, Layout, erstes vollständiges Bild und
+Zeichenaufrufe auf dem UI-Thread. Er verwendet synthetische Daten im Browser;
+API- und Netzwerkzeit sind nicht enthalten. Zur Bewertung schwacher Geräte die
+CPU-Drosselung der Browser-Entwicklerwerkzeuge aktivieren oder auf Zielhardware
+messen. Kurze Zeichenaufrufe während Pan/Zoom messen die Cache-Nutzung, nicht die
+Rasterisierungsdauer des nächsten vollständigen Bildes im Worker.
+
+Der separate 3D-Benchmark ist unter
+`http://127.0.0.1:8766/tests/graph-flight-benchmark.html?nodes=100000` erreichbar.
+Er verwendet zwölf Space-Cluster, verknüpfte Tickets und unterschiedliche
+Erstellungs-/Änderungsdaten. Die Zeitachse kann während der Messung umgeschaltet
+werden. Auch dieser Benchmark enthält keine API- oder Netzwerkzeit.

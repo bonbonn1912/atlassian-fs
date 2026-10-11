@@ -165,7 +165,7 @@ SETTINGS_FIELD_SPECS: dict[str, dict[str, tuple]] = {
     "mcp": {key: ("int", MCP_OUTPUT_MIN_CHARS, MCP_OUTPUT_MAX_CHARS)
             for key in MCP_DEFAULT_OUTPUT},
     "graph": {
-        "max_visible_nodes": ("int", 10, 20000),
+        "max_visible_nodes": ("int", 10, 100_000),
         "default_hops": ("int", 0, 3),
         "max_hops": ("int", 1, 3),
     },

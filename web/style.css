@@ -2392,3 +2392,26 @@ a:hover {
   margin-top: 0;
   margin-bottom: 8px;
 }
+
+/* 3D time flight uses the graph's existing palette and toolbar components. */
+.graph-toolbar { height: auto; min-height: 50px; flex-wrap: wrap; padding-block: 8px; }
+.graph-toolbar > .graph-control-item, .graph-toolbar > button, .graph-center-form { flex-shrink: 0; }
+.graph-toolbar .number-sm { min-width: 76px; }
+.graph-flight-container { position: absolute; inset: 0; overflow: hidden; }
+#graph-flight-btn.active { background-color: var(--confluence-blue); color: #fff; border-color: var(--confluence-blue); }
+.graph-flight-hud {
+  position: absolute; left: 16px; top: 16px; z-index: 4; pointer-events: none;
+  max-width: min(420px, calc(100% - 32px)); padding: 10px 14px;
+  background: var(--bg-surface); border: 1px solid var(--border-light);
+  border-radius: var(--radius-md); box-shadow: var(--shadow-sm); color: var(--text-main); font-size: 12px;
+}
+.graph-flight-time-caption { font-weight: 600; margin-bottom: 4px; }
+.graph-flight-date-hint { color: var(--text-sub); font-size: 11px; margin-top: 4px; }
+.graph-flight-help {
+  position: absolute; left: 16px; bottom: 16px; z-index: 4;
+  max-width: min(420px, calc(100% - 32px)); padding: 8px 12px;
+  background: var(--bg-surface); border: 1px solid var(--border-light);
+  border-radius: var(--radius-md); color: var(--text-sub); font-size: 12px;
+}
+.graph-flight-help summary { cursor: pointer; color: var(--text-main); font-weight: 600; }
+.graph-flight-help p { margin-top: 8px; }

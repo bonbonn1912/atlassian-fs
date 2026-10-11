@@ -345,9 +345,141 @@ function resolveCollisions(grid, n, x, y, vx, vy, radii, maxR, strength, usePosi
   return overlaps;
 }
 
+// Large graphs use a bounded force simulation on a quotient graph, then expand
+// every cluster. No documents or edges are sampled out of the displayed graph.
+const LARGE_GRAPH_THRESHOLD = 5000;
+const MAX_CLUSTERS = 384;
+
+function* largeLayoutSteps(msg, post) {
+  const { count: n, radii, links, importance, importanceMode, center } = msg;
+  const graph = buildAdjacency(n, links);
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) =>
+    (importanceMode ? importance[b] - importance[a] : 0) || graph.deg[b] - graph.deg[a] || a - b);
+  if (center >= 0) { order.splice(order.indexOf(center), 1); order.unshift(center); }
+  const capacity = Math.ceil(n / MAX_CLUSTERS);
+  const clusterOf = new Int32Array(n).fill(-1);
+  const clusters = [];
+  let cursor = 0;
+  while (cursor < n) {
+    const members = [];
+    const id = clusters.length;
+    let head = 0;
+    while (members.length < capacity) {
+      // Grow locally before taking the next unassigned seed (also packs isolates).
+      if (head < members.length) {
+        const v = members[head++];
+        for (let k = graph.start[v]; k < graph.start[v + 1] && members.length < capacity; k++) {
+          const w = graph.adj[k];
+          if (clusterOf[w] !== -1) continue;
+          clusterOf[w] = id;
+          members.push(w);
+        }
+      } else {
+        while (cursor < n && clusterOf[order[cursor]] !== -1) cursor++;
+        if (cursor === n) break;
+        const v = order[cursor++];
+        clusterOf[v] = id;
+        members.push(v);
+      }
+    }
+    if (members.length) clusters.push(members);
+    yield;
+  }
+  const count = clusters.length;
+  const coarseRadii = new Float32Array(count);
+  const coarseImportance = new Float32Array(count);
+  const local = new Float32Array(2 * n);
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  for (let c = 0; c < count; c++) {
+    const members = clusters[c];
+    if (importanceMode) members.sort((a, b) => importance[b] - importance[a] || a - b);
+    let maxR = 0;
+    for (const v of members) {
+      maxR = Math.max(maxR, radii[v]);
+      coarseImportance[c] = Math.max(coarseImportance[c], importance[v]);
+    }
+    // The conservative spacing keeps all node bodies apart without an O(n) simulation.
+    const spacing = (2 * maxR + PADDING) * 1.1;
+    members.forEach((v, i) => {
+      const radius = spacing * Math.sqrt(i);
+      local[2 * v] = Math.cos(i * golden) * radius;
+      local[2 * v + 1] = Math.sin(i * golden) * radius;
+    });
+    coarseRadii[c] = spacing * Math.sqrt(members.length - 1) + maxR;
+  }
+  const pairs = new Set();
+  const coarseLinks = [];
+  for (let k = 0; k < links.length; k += 2) {
+    let a = clusterOf[links[k]], b = clusterOf[links[k + 1]];
+    if (a === b) continue;
+    if (a > b) [a, b] = [b, a];
+    const key = a * count + b;
+    if (pairs.has(key)) continue;
+    pairs.add(key);
+    coarseLinks.push(a, b);
+  }
+  const positions = new Float32Array(2 * n);
+  let coarse;
+  const steps = layoutSteps({ ...msg, count, radii: coarseRadii,
+    importance: coarseImportance, links: Uint32Array.from(coarseLinks),
+    center: center >= 0 ? clusterOf[center] : -1, iterations: 80 }, (m) => { coarse = m.positions; });
+  // Show an initial cluster layout immediately; only publish one refined layout
+  // afterwards, avoiding repeated 100k-position copies and main-thread indexing.
+  const expand = (type, progress) => {
+    for (let v = 0; v < n; v++) {
+      const c = clusterOf[v];
+      positions[2 * v] = coarse[2 * c] + local[2 * v];
+      positions[2 * v + 1] = coarse[2 * c + 1] + local[2 * v + 1];
+    }
+    if (center >= 0) {
+      const cx = positions[2 * center], cy = positions[2 * center + 1];
+      for (let v = 0; v < n; v++) { positions[2 * v] -= cx; positions[2 * v + 1] -= cy; }
+    }
+    post({ id: msg.id, type, progress, positions: positions.slice() });
+  };
+  let initial = false;
+  while (!steps.next().done) {
+    if (coarse && !initial) { expand('tick', 0.05); initial = true; }
+    yield;
+  }
+  // Deterministic circle packing guarantees disjoint clusters even when the
+  // bounded force simulation finishes before all coarse collisions have settled.
+  let maxR = 0;
+  for (const r of coarseRadii) maxR = Math.max(maxR, r);
+  const cell = 2 * maxR + PADDING;
+  const occupied = new Map();
+  for (let c = 0; c < count; c++) {
+    const ox = coarse[2 * c], oy = coarse[2 * c + 1];
+    for (let attempt = 0; ; attempt++) {
+      const distance = cell * 0.5 * Math.sqrt(attempt);
+      const x = ox + Math.cos(attempt * golden) * distance;
+      const y = oy + Math.sin(attempt * golden) * distance;
+      const gx = Math.floor(x / cell), gy = Math.floor(y / cell);
+      let overlap = false;
+      for (let dx = -1; dx <= 1 && !overlap; dx++) {
+        for (let dy = -1; dy <= 1 && !overlap; dy++) {
+          for (const other of occupied.get(`${gx + dx},${gy + dy}`) || []) {
+            if (Math.hypot(x - coarse[2 * other], y - coarse[2 * other + 1]) <
+                coarseRadii[c] + coarseRadii[other] + PADDING) { overlap = true; break; }
+          }
+        }
+      }
+      if (overlap) continue;
+      coarse[2 * c] = x; coarse[2 * c + 1] = y;
+      const key = `${gx},${gy}`;
+      if (!occupied.has(key)) occupied.set(key, []);
+      occupied.get(key).push(c);
+      break;
+    }
+    yield;
+  }
+  expand('done', 1);
+}
+
 // ------------------------------------------------------------------ simulation
 
 function* layoutSteps(msg, post) {
+  if (msg.count > LARGE_GRAPH_THRESHOLD) { yield* largeLayoutSteps(msg, post); return; }
   const n = msg.count;
   const radii = msg.radii;
   const links = msg.links;
@@ -365,6 +497,9 @@ function* layoutSteps(msg, post) {
 
   const graph = buildAdjacency(n, links);
   initialPositions(n, radii, graph, center, x, y, importanceMode, importance);
+
+  emit('tick', 0.01);
+  yield;
 
   let minImp = Infinity, maxImp = -Infinity;
   if (importanceMode && importance) {
@@ -395,7 +530,7 @@ function* layoutSteps(msg, post) {
   }
 
   // Larger graphs trade a little accuracy for speed (theta 0.9 -> 1.2).
-  const iterations = n < 300 ? 300 : n < 2000 ? 330 : 300;
+  const iterations = msg.iterations || (n < 300 ? 300 : n < 2000 ? 330 : 300);
   const theta2 = n < 1500 ? 0.81 : 1.44;
   const alphaMin = 0.001;
   const alphaDecay = 1 - Math.pow(alphaMin, 1 / iterations);
@@ -467,6 +602,7 @@ const isWorker = typeof WorkerGlobalScope !== 'undefined' && self instanceof Wor
 if (isWorker) {
   self.onmessage = (event) => {
     try {
+      self.postMessage({ id: event.data.id, type: 'ready' });
       runLayout(event.data, (m) => self.postMessage(m, [m.positions.buffer]));
     } catch (err) {
       self.postMessage({ id: event.data && event.data.id, type: 'error', message: String((err && err.message) || err) });

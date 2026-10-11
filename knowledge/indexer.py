@@ -517,6 +517,9 @@ class JobManager:
             initial_uid = start_page_uid
 
             def fail_job(message: str, log_level: str = "error") -> None:
+                with self._live_lock:
+                    self._live["phase"] = "idle"
+                    self._live["last_message"] = message
                 db.update_job(
                     conn,
                     job_id,
@@ -525,12 +528,12 @@ class JobManager:
                     last_message=message,
                 )
                 db.add_job_log(conn, job_id, log_level, message)
-                with self._live_lock:
-                    self._live["phase"] = "idle"
-                    self._live["last_message"] = message
 
             def finish_job(state: str, message: str) -> None:
                 """Terminal state before the BFS loop started (client/stop/budget)."""
+                with self._live_lock:
+                    self._live["phase"] = "idle"
+                    self._live["last_message"] = message
                 db.update_job(
                     conn,
                     job_id,
@@ -539,9 +542,6 @@ class JobManager:
                     last_message=message,
                 )
                 db.add_job_log(conn, job_id, "info", f"Job beendet mit Status '{state}': {message}")
-                with self._live_lock:
-                    self._live["phase"] = "idle"
-                    self._live["last_message"] = message
 
             # Start page resolution if unresolved title UID
             if is_unresolved_uid(initial_uid):

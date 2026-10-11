@@ -122,8 +122,14 @@ Der Crawler lädt Dokumente gebündelt statt einzeln:
   (Netzwerk & Rate-Limiting) bzw. in den Crawl-Standardwerten. Zusammen mit dem Sleep zwischen
   Requests sinkt die Laufzeit grob auf `Seiten/100 × Sleep` statt `Seiten × Sleep`.
 - Auch die Auflistung nutzt 100 Einträge je Request (Spaces, Space-Seiten, CQL-Suche, Kindseiten).
-  Kindseiten (`include_child_pages`) und Titel-Auflösungen benötigen weiterhin je Dokument einen
-  Request – für maximale Geschwindigkeit diese Optionen bei reinen Space-Crawls abschalten.
+- **Kindseiten** werden gebündelt abgefragt: bis zu 25 Elternseiten pro CQL-Request
+  (`type=page and ancestor in (…)`); nur bei sehr dichten Hierarchien (>100 Treffer) fällt der
+  Client auf exakte Einzelabfragen zurück. Bei Space-Crawls kosten die Eltern-Kind-Kanten
+  ohnehin keinen Extra-Request (Ableitung aus `expand=ancestors`).
+- **Titel-Links** (`/display/SPACE/Titel`) werden mit bis zu 50 Titeln pro Request aufgelöst und
+  dauerhaft in `title_resolutions` gecacht – Folgeläufe kosten dafür keine Requests mehr.
+- Für maximale Geschwindigkeit bleiben zwei Optionen abschaltbar: „Unterseiten berücksichtigen"
+  (Eltern-Kind-Kanten) und „Jira-Remote-Links abrufen" (Jira→Confluence-Kanten).
 
 ---
 

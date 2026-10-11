@@ -208,16 +208,41 @@ class ConfluenceClient:
                 except Exception as exc:
                     out[pid] = exc
 
+        if not include_children:
+            return out
+
+        page_ids = [pid for pid, item in out.items() if not isinstance(item, Exception)]
+        children_map: dict[str, list[tuple[str, str]]] | None = None
+        if page_ids:
+            try:
+                children_map = self.list_children_bulk(page_ids, max_children)
+            except CrawlStopped:
+                raise
+            except BudgetExceeded as exc:
+                # Child lists are an enrichment: keep the fetched documents
+                # instead of throwing away the whole batch.
+                logger.warning(
+                    "Kinderlisten nicht vollständig abrufbar (%s) – Dokumente ohne Kindkanten", exc
+                )
+            except Exception as exc:
+                logger.warning("Kindseiten nicht abrufbar (%s) – Fallback Einzelabfragen", exc)
+
         for pid, item in out.items():
-            if isinstance(item, Exception) or not include_children:
+            if isinstance(item, Exception):
+                continue
+            if children_map is not None:
+                for cid, ctitle in children_map.get(pid, []):
+                    item.links.append(LinkTarget(
+                        uid=confluence_uid(cid), kind=EDGE_PARENT_OF,
+                        relation_label="parent of", source_field="children",
+                        anchor_text=ctitle, evidence_url=confluence_page_url(self.ctx, cid),
+                        title_hint=ctitle))
                 continue
             try:
                 self._add_child_links(item, max_children)
             except CrawlStopped:
                 raise
             except BudgetExceeded as exc:
-                # Child lists are an enrichment: keep the fetched documents
-                # instead of throwing away the whole batch.
                 logger.warning(
                     "Kinderlisten nicht vollständig abrufbar (%s) – Dokumente ohne Kindkanten", exc
                 )
@@ -340,6 +365,67 @@ class ConfluenceClient:
     def enrich_children(self, doc: FetchedDocument, max_children: int = 500) -> None:
         """Add `parent_of` links to an already fetched document (one request)."""
         self._add_child_links(doc, max_children)
+
+    def list_children_bulk(
+        self, page_ids: list[str], max_children: int = 500, group_size: int = 25,
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Direct children (id, title) for several pages with few requests.
+
+        Uses CQL `type=page and ancestor in (id1, id2, …)` and derives each
+        result's direct parent from its ancestor chain. Groups whose answer may
+        be truncated (>=100 matches) or unsupported fall back to one request
+        per page, so the result is always exact.
+        """
+        unique: list[str] = []
+        for raw in page_ids:
+            pid = str(raw).strip()
+            if pid.isdigit() and pid not in unique:
+                unique.append(pid)
+        out: dict[str, list[tuple[str, str]]] = {pid: [] for pid in unique}
+        if not unique:
+            return out
+
+        claimed_unsupported = getattr(self, "_children_cql_supported", None) is False
+        step = max(1, min(int(group_size), 25))
+        for start in range(0, len(unique), step):
+            group = unique[start:start + step]
+            results: list[dict] | None = None
+            if not claimed_unsupported:
+                cql = "type=page and ancestor in (" + ",".join(group) + ")"
+                try:
+                    data = self.http.get_json(
+                        "/rest/api/content/search",
+                        {"cql": cql, "limit": 100, "expand": "ancestors"},
+                    )
+                    results = [r for r in ((data or {}).get("results") or [])
+                               if isinstance(r, dict)]
+                except (CrawlStopped, BudgetExceeded):
+                    raise
+                except Exception as exc:
+                    # Endpoint/Version unterstützt die CQL-Abfrage nicht
+                    self._children_cql_supported = False
+                    logger.info("Kindseiten-CQL nicht verfügbar (%s) – Einzelabfragen", exc)
+                    results = None
+
+            if results is None or len(results) >= 100:
+                # truncated/unsupported -> exakt per Einzelabfrage
+                for pid in group:
+                    try:
+                        out[pid] = self.list_child_pages(pid, max_children)
+                    except (CrawlStopped, BudgetExceeded):
+                        raise
+                    except Exception as exc:
+                        # Seite gelöscht/gesperrt -> keine Kindkanten
+                        logger.info("Kinder von %s nicht abrufbar: %s", pid, exc)
+                        out[pid] = []
+                continue
+            for item in results:
+                ancestors = [a for a in (item.get("ancestors") or []) if isinstance(a, dict)]
+                parent_id = str(ancestors[-1].get("id") or "") if ancestors else ""
+                cid = str(item.get("id") or "")
+                if parent_id in out and cid.isdigit() and len(out[parent_id]) < max_children:
+                    out[parent_id].append((cid, str(item.get("title") or "")))
+        return out
 
     def _list_space_page_items(
         self, space_key: str, max_items: int, *, expand: str = ""

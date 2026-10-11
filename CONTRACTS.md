@@ -227,6 +227,10 @@ class ConfluenceClient:
     def fetch_documents_bulk(self, page_ids: list[str], *, include_children: bool = False,
                              max_children: int = 500, scan_plain_keys: bool = False,
                              chunk_size: int = 100) -> dict[str, FetchedDocument | Exception]
+    def list_children_bulk(self, page_ids: list[str], max_children: int = 500,
+                           group_size: int = 25) -> dict[str, list[tuple[str, str]]]
+    def resolve_titles_bulk(self, pairs: list[tuple[str, str]],
+                            chunk_size: int = 50) -> dict[tuple[str, str], str | None]
     def resolve_title(self, space_key: str, title: str) -> str | None   # page id; None if 0 or >1 hits
     def test_connection(self) -> dict   # {"ok": bool, "message": str, ...}
 ```
@@ -261,7 +265,15 @@ class ConfluenceClient:
   Ergebnis `{page_id: FetchedDocument|Exception}`; IDs, die die Antwort nicht enthält, werden
   einzeln nachgeladen (nur so lässt sich 403 „forbidden" von 404 „missing" unterscheiden).
   `include_children` kostet wie bisher
-  einen zusätzlichen Request je Seite (kein Bulk-Endpunkt vorhanden).
+  einen zusätzlichen Request – allerdings gebündelt: `list_children_bulk()` fragt bis zu 25
+  Elternseiten mit einem CQL-Request ab (`type=page and ancestor in (id1,id2,…)`, direkter
+  Parent = letzter Ancestor). Liefert die Antwort 100 Treffer (dichtes Teilbaum-Limit) oder
+  unterstützt die Instanz die Abfrage nicht, wird pro Seite exakt nachgeladen (Kosten wie vorher).
+  Bei Space-Crawls sind die Kindkanten ohnehin kostenlos (`expand=ancestors` im Listing).
+  `resolve_titles_bulk()` löst bis zu 50 `/display/SPACE/Titel`-Links je Request auf
+  (`title in (…)`); CQL-unsichere Titel und abgeschnittene Antworten fallen auf Einzelabfragen
+  zurück. Beide Ergebnisse werden im `ConfigStore`-unabhängigen `title_resolutions`-Cache
+  persistiert bzw. direkt verwendet.
   Listen-/Suchlimits sind auf 100 je Request erhöht (`CHILD_PAGE_SIZE`, `SPACE_PAGE_SIZE`,
   `SEARCH_PAGE_SIZE`, `BULK_PAGE_SIZE`). `list_pages_modified_since` validiert Space-Keys
   gegen `^[A-Za-z0-9_.~:@-]+$` (CQL-Injektion) und wirft sonst `ValueError`.

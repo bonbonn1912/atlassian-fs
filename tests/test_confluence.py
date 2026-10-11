@@ -615,6 +615,85 @@ class TestConfluenceClient(unittest.TestCase):
         self.assertIn("/rest/api/content?", requested_urls[0])   # Einzelabruf-Endpoint
         self.assertNotIn("/search?", requested_urls[0])
 
+    # ------------------------------------------------------------ bulk children
+
+    def test_list_children_bulk_groups_by_direct_parent(self):
+        requested_urls: list[str] = []
+
+        def transport(url, headers, timeout, ssl_context, max_bytes):
+            requested_urls.append(url)
+            payload = {"results": [
+                {"id": "11", "title": "Kind A", "type": "page", "ancestors": [{"id": "1"}]},
+                {"id": "12", "title": "Kind B", "type": "page", "ancestors": [{"id": "1"}]},
+                {"id": "21", "title": "Kind C", "type": "page",
+                 "ancestors": [{"id": "1"}, {"id": "2"}]},
+            ], "limit": 100, "start": 0, "size": 3}
+            return HttpResponse(200, {"content-type": "application/json"},
+                                json.dumps(payload).encode("utf-8"))
+
+        conf = self._make_client(transport)
+        children = conf.list_children_bulk(["1", "2"])
+
+        self.assertEqual(len(requested_urls), 1)                    # ein Request für beide Eltern
+        first = urllib.parse.unquote_plus(requested_urls[0])
+        self.assertIn("ancestor in (1,2)", first)
+        self.assertEqual(children["1"], [("11", "Kind A"), ("12", "Kind B")])
+        self.assertEqual(children["2"], [("21", "Kind C")])         # direkter Parent = letzter Ancestor
+        self.assertEqual(children["1"][0][0], "11")
+
+    def test_list_children_bulk_falls_back_when_result_may_be_truncated(self):
+        requested_urls: list[str] = []
+
+        def transport(url, headers, timeout, ssl_context, max_bytes):
+            requested_urls.append(url)
+            if "/child/page" in url:
+                return HttpResponse(200, {"content-type": "application/json"},
+                                    json.dumps({"results": [], "limit": 100, "start": 0, "size": 0}).encode("utf-8"))
+            payload = {"results": [
+                {"id": str(900 + i), "title": f"X{i}", "type": "page",
+                 "ancestors": [{"id": "1"}]} for i in range(100)
+            ], "limit": 100, "start": 0, "size": 100}
+            return HttpResponse(200, {"content-type": "application/json"},
+                                json.dumps(payload).encode("utf-8"))
+
+        conf = self._make_client(transport)
+        children = conf.list_children_bulk(["1", "2"])
+
+        self.assertTrue(any("/child/page" in u for u in requested_urls))  # exakte Einzelabfragen
+        self.assertEqual(children, {"1": [], "2": []})
+
+    def test_fetch_documents_bulk_uses_bulk_child_listing(self):
+        requested_urls: list[str] = []
+
+        def transport(url, headers, timeout, ssl_context, max_bytes):
+            requested_urls.append(url)
+            if "/child/page" in url:
+                raise AssertionError("kein Einzel-Kinderabruf erwartet")
+            if "cql=id+in" in url or "cql=id%20in" in url:
+                payload = {"results": [
+                    {"id": "1", "type": "page", "title": "Seite 1", "space": {"key": "ENG"},
+                     "version": {"number": 1}, "body": {"storage": {"value": "<p>a</p>"}},
+                     "_links": {"webui": "/display/ENG/1"}},
+                    {"id": "2", "type": "page", "title": "Seite 2", "space": {"key": "ENG"},
+                     "version": {"number": 1}, "body": {"storage": {"value": "<p>b</p>"}},
+                     "_links": {"webui": "/display/ENG/2"}},
+                ], "limit": 2, "start": 0, "size": 2}
+            else:  # Kindseiten-Suche (ancestor in …)
+                payload = {"results": [
+                    {"id": "99", "title": "Unter der 1", "type": "page",
+                     "ancestors": [{"id": "1"}]},
+                ], "limit": 100, "start": 0, "size": 1}
+            return HttpResponse(200, {"content-type": "application/json"},
+                                json.dumps(payload).encode("utf-8"))
+
+        conf = self._make_client(transport)
+        result = conf.fetch_documents_bulk(["1", "2"], include_children=True)
+
+        self.assertEqual(len(requested_urls), 2)     # 1 Seitenbulk + 1 Kinder-CQL
+        self.assertEqual([lk.uid for lk in result["1"].links if lk.kind == EDGE_PARENT_OF],
+                         ["confluence:99"])
+        self.assertEqual([lk for lk in result["2"].links if lk.kind == EDGE_PARENT_OF], [])
+
 
 if __name__ == "__main__":
     unittest.main()

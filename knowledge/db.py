@@ -15,7 +15,7 @@ from typing import Any, Iterable, Iterator
 
 from .models import (
     JOB_ACTIVE_STATES, JOB_INTERRUPTED, STATE_DISCOVERED, STATE_ERROR,
-    STATE_INDEXED, STATE_SKIPPED, Chunk, FetchedDocument, KnowledgeError,
+    STATE_INDEXED, STATE_SKIPPED, SOURCE_TYPES, Chunk, FetchedDocument, KnowledgeError,
     LinkTarget, parse_uid,
 )
 
@@ -110,12 +110,82 @@ SCHEMA_V3 = """
 ALTER TABLE documents ADD COLUMN source_created_at TEXT;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)]
+# GitLab commits: widen the source_type CHECK (SQLite cannot alter a CHECK
+# constraint, so the documents table is rebuilt; ids are preserved, hence all
+# edges/chunks stay valid) and remember per project/ref how far a sync got.
+DOCUMENTS_V4 = """
+CREATE TABLE documents_v4 (
+  id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE,
+  source_type TEXT NOT NULL CHECK(source_type IN ('confluence','jira','gitlab')),
+  source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL DEFAULT '', space_or_project TEXT,
+  status_label TEXT, document_type TEXT,
+  body_text TEXT NOT NULL DEFAULT '', source_version TEXT,
+  source_updated_at TEXT, content_hash TEXT,
+  state TEXT NOT NULL DEFAULT 'discovered', fetched_at TEXT, last_error TEXT,
+  labels TEXT NOT NULL DEFAULT '', source_created_at TEXT
+);
+"""
+DOCUMENT_COLUMNS_V4 = (
+    "id, uid, source_type, source_id, title, url, space_or_project, status_label, "
+    "document_type, body_text, source_version, source_updated_at, content_hash, state, "
+    "fetched_at, last_error, labels, source_created_at")
+SCHEMA_V4_EXTRA = """
+CREATE INDEX IF NOT EXISTS idx_docs_type_state ON documents(source_type,state);
+CREATE INDEX IF NOT EXISTS idx_docs_project ON documents(space_or_project);
+CREATE TABLE IF NOT EXISTS gitlab_sync_state (
+  project_id TEXT NOT NULL,      -- numeric GitLab project id
+  ref TEXT NOT NULL,             -- '' = default branch, '*' = all branches, else ref name
+  synced_until TEXT NOT NULL,    -- UTC timestamp up to which the listing was complete
+  last_sha TEXT,
+  scan_signature TEXT NOT NULL DEFAULT '',  -- prefixes/filter/ref scope of that sync
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, ref)
+);
+"""
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """Rebuild `documents` with 'gitlab' in the source_type CHECK.
+
+    Foreign keys must be off while the old table is dropped, otherwise SQLite
+    would cascade-delete all chunks and edges. Must run outside a transaction.
+    """
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='documents'").fetchone()
+    needs_rebuild = row is not None and "'gitlab'" not in (row[0] or "")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(conn):
+            if needs_rebuild:
+                conn.execute("DROP TABLE IF EXISTS documents_v4")
+                conn.execute(DOCUMENTS_V4)
+                conn.execute(f"INSERT INTO documents_v4({DOCUMENT_COLUMNS_V4}) "
+                             f"SELECT {DOCUMENT_COLUMNS_V4} FROM documents")
+                conn.execute("DROP TABLE documents")
+                conn.execute("ALTER TABLE documents_v4 RENAME TO documents")
+            for statement in _split_sql(SCHEMA_V4_EXTRA):
+                conn.execute(statement)
+            job_cols = {r[1] for r in conn.execute("PRAGMA table_info(crawl_jobs)")}
+            if "gitlab_indexed" not in job_cols:
+                conn.execute("ALTER TABLE crawl_jobs ADD COLUMN gitlab_indexed "
+                             "INTEGER NOT NULL DEFAULT 0")
+            broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if broken:
+                raise DatabaseError(f"Migration 4: {len(broken)} verwaiste Fremdschlüssel")
+            conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)",
+                         (4, now_iso()))
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+MIGRATIONS: list[tuple[int, Any]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3),
+                                     (4, _migrate_v4)]
 
 # Negative results are re-checked after this many seconds (page may be created later).
 TITLE_RESOLUTION_MISS_TTL_SECONDS = 7 * 24 * 60 * 60
 
 JOB_COLUMNS = ("state", "start_page_uid", "finished_at", "pages_indexed", "jira_indexed",
+               "gitlab_indexed",
                "api_requests", "skipped", "errors", "current_uid", "last_message")
 
 MAX_EDGES_PER_DOCUMENT = 5000
@@ -169,6 +239,9 @@ def init_db(conn: sqlite3.Connection) -> int:
     applied = {r[0] for r in conn.execute("SELECT version FROM schema_migrations")}
     for version, sql in MIGRATIONS:
         if version in applied:
+            continue
+        if callable(sql):
+            sql(conn)   # records its own schema_migrations row
             continue
         with transaction(conn):
             for statement in _split_sql(sql):
@@ -324,6 +397,14 @@ def mark_document_state(conn: sqlite3.Connection, uid: str, state: str, error: s
         conn.execute("UPDATE documents SET state=?, last_error=? WHERE uid=?", (state, error, uid))
 
 
+def delete_document(conn: sqlite3.Connection, uid: str) -> bool:
+    """Remove a document with its chunks and edges (e.g. a commit that no longer
+    matches the configured issue keys). Returns True if it existed."""
+    with transaction(conn):
+        cur = conn.execute("DELETE FROM documents WHERE uid=?", (uid,))
+    return cur.rowcount > 0
+
+
 def get_outgoing_links(conn: sqlite3.Connection, uid: str) -> list[LinkTarget]:
     """Stored outgoing edges of a document as LinkTargets (deterministic order)."""
     rows = conn.execute(
@@ -335,13 +416,48 @@ def get_outgoing_links(conn: sqlite3.Connection, uid: str) -> list[LinkTarget]:
                        evidence_url=r["evidence_url"], title_hint=r["title"]) for r in rows]
 
 
-def get_existing_document_uids(conn: sqlite3.Connection) -> list[str]:
-    """Return all UIDs of documents that have been previously indexed or had errors."""
-    rows = conn.execute(
-        "SELECT uid FROM documents WHERE state IN (?, ?) ORDER BY id ASC",
-        (STATE_INDEXED, STATE_ERROR),
-    ).fetchall()
+def get_existing_document_uids(conn: sqlite3.Connection,
+                               source_types: Iterable[str] | None = None) -> list[str]:
+    """Return all UIDs of documents that have been previously indexed or had errors.
+
+    `source_types` optionally restricts the result (e.g. Atlassian refresh jobs
+    must not pick up GitLab commits).
+    """
+    sql = "SELECT uid FROM documents WHERE state IN (?, ?)"
+    args: list[Any] = [STATE_INDEXED, STATE_ERROR]
+    if source_types is not None:
+        types = list(source_types)
+        if not types:
+            return []
+        sql += " AND source_type IN (" + ",".join("?" * len(types)) + ")"
+        args.extend(types)
+    rows = conn.execute(sql + " ORDER BY id ASC", args).fetchall()
     return [r[0] for r in rows]
+
+
+# ----------------------------------------------------------------- gitlab sync state
+
+def get_gitlab_sync_state(conn: sqlite3.Connection, project_id: str, ref: str) -> dict | None:
+    return row_to_dict(conn.execute(
+        "SELECT project_id, ref, synced_until, last_sha, scan_signature, updated_at "
+        "FROM gitlab_sync_state WHERE project_id=? AND ref=?",
+        (str(project_id), ref or "")).fetchone())
+
+
+def save_gitlab_sync_state(conn: sqlite3.Connection, project_id: str, ref: str,
+                           synced_until: str, last_sha: str | None = None,
+                           scan_signature: str = "") -> None:
+    """Record that all commits of project/ref up to `synced_until` are indexed.
+
+    `scan_signature` identifies the scan settings (issue prefixes, key filter);
+    a checkpoint with a different signature must not be used incrementally.
+    """
+    conn.execute(
+        "INSERT INTO gitlab_sync_state(project_id, ref, synced_until, last_sha, scan_signature, "
+        "updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id, ref) DO UPDATE SET "
+        "synced_until=excluded.synced_until, last_sha=excluded.last_sha, "
+        "scan_signature=excluded.scan_signature, updated_at=excluded.updated_at",
+        (str(project_id), ref or "", synced_until, last_sha, scan_signature or "", now_iso()))
 
 
 # ----------------------------------------------------------------- title resolutions
@@ -463,9 +579,9 @@ def get_job_log(conn: sqlite3.Connection, job_id: int, limit: int = 100) -> list
 # ----------------------------------------------------------------- stats
 
 def get_stats(conn: sqlite3.Connection) -> dict:
-    by_type_state: dict[str, dict[str, int]] = {"confluence": {}, "jira": {}}
+    by_type_state: dict[str, dict[str, int]] = {t: {} for t in SOURCE_TYPES}
     for r in conn.execute("SELECT source_type, state, COUNT(*) FROM documents GROUP BY 1,2"):
-        by_type_state[r[0]][r[1]] = r[2]
+        by_type_state.setdefault(r[0], {})[r[1]] = r[2]
     edges_by_kind = {r[0]: r[1] for r in conn.execute("SELECT kind, COUNT(*) FROM edges GROUP BY kind")}
     return {
         "documents_total": sum(sum(v.values()) for v in by_type_state.values()),

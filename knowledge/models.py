@@ -8,13 +8,13 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-SOURCE_TYPES = ("confluence", "jira")
+SOURCE_TYPES = ("confluence", "jira", "gitlab")
 
 # Edge kinds (spec 8.2). Edges are always stored with the *fetched* document as
 # source, so a refresh can atomically replace all outgoing edges.
 EDGE_LINKS_TO = "links_to"                        # Confluence -> Confluence
 EDGE_PARENT_OF = "parent_of"                      # Confluence parent -> child
-EDGE_MENTIONS_JIRA = "mentions_jira"              # Confluence -> Jira
+EDGE_MENTIONS_JIRA = "mentions_jira"              # Confluence/GitLab commit -> Jira
 EDGE_JIRA_RELATES_TO = "jira_relates_to"          # Jira -> Jira (issue links, mentions)
 EDGE_JIRA_PARENT_OF = "jira_parent_of"            # Jira -> Jira (relation_label "parent of" / "child of")
 EDGE_LINKS_TO_CONFLUENCE = "links_to_confluence"  # Jira -> Confluence
@@ -55,6 +55,20 @@ def jira_uid(issue_key: str) -> str:
     return f"jira:{issue_key.strip().upper()}"
 
 
+def gitlab_commit_uid(project_id: str | int, sha: str) -> str:
+    """'gitlab:<numeric project id>:<full commit sha>' (sha lower-cased)."""
+    return f"gitlab:{str(project_id).strip()}:{sha.strip().lower()}"
+
+
+def split_gitlab_uid(uid: str) -> tuple[str, str]:
+    """'gitlab:42:abc…' -> ('42', 'abc…'). Raises ValueError."""
+    source_type, rest = parse_uid(uid)
+    project_id, _, sha = rest.partition(":")
+    if source_type != "gitlab" or not project_id or not sha:
+        raise ValueError(f"invalid gitlab uid: {uid!r}")
+    return project_id, sha
+
+
 def unresolved_page_uid(space_key: str, title: str) -> str:
     """Reference to a Confluence page known only by space key + title.
 
@@ -76,12 +90,12 @@ def parse_uid(uid: str) -> tuple[str, str]:
 
 
 def is_document_uid(uid: str) -> bool:
-    """True for uids of fetchable documents (Confluence/Jira).
+    """True for uids of fetchable documents (Confluence/Jira/GitLab commits).
 
     Pseudo uids such as `space:ENG` (a space root URL used as start page) are
     not documents and must never become graph nodes.
     """
-    return isinstance(uid, str) and uid.startswith(("confluence:", "jira:"))
+    return isinstance(uid, str) and uid.startswith(("confluence:", "jira:", "gitlab:"))
 
 
 def is_unresolved_uid(uid: str) -> bool:
@@ -98,6 +112,8 @@ def split_unresolved_uid(uid: str) -> tuple[str, str]:
 def edge_kind_for(source_type: str, target_uid: str) -> str:
     """Default edge kind for a plain link from a document of source_type."""
     target_type = parse_uid(target_uid)[0]
+    if source_type == "gitlab":
+        return EDGE_MENTIONS_JIRA
     if source_type == "confluence":
         return EDGE_MENTIONS_JIRA if target_type == "jira" else EDGE_LINKS_TO
     return EDGE_JIRA_RELATES_TO if target_type == "jira" else EDGE_LINKS_TO_CONFLUENCE

@@ -105,6 +105,41 @@ def cmd_refresh(args: argparse.Namespace) -> None:
     print(f"Job beendet mit Status '{status.get('state')}': {status.get('last_message')}")
 
 
+def cmd_gitlab_sync(args: argparse.Namespace) -> None:
+    from knowledge.indexer import JobManager
+
+    config_store = ConfigStore(args.config)
+    db_path = resolve_db_path(config_store.get())
+    payload: dict = {"gitlab_only": True}
+    if args.full:
+        payload["refresh_existing"] = True
+    if args.since:
+        payload["gitlab_since"] = args.since
+    if args.max_commits:
+        payload["max_gitlab_commits"] = args.max_commits
+
+    mgr = JobManager(config_store, db_path)
+    job_id = mgr.start(payload)["job_id"]
+    print(f"GitLab-Job gestartet (ID {job_id}). Warte auf Fertigstellung...")
+    try:
+        while mgr.is_running():
+            status = mgr.status(job_id) or {}
+            sys.stderr.write(f"\r[{status.get('state')}] {status.get('last_message') or ''} "
+                             f"(Commits: {status.get('gitlab_indexed', 0)}, "
+                             f"Fehler: {status.get('errors', 0)})")
+            sys.stderr.flush()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        mgr.stop(job_id)   # the worker stops before its next request
+        while mgr.is_running():
+            time.sleep(0.2)
+    status = mgr.status(job_id) or {}
+    sys.stderr.write("\n")
+    print(f"Job beendet mit Status '{status.get('state')}': {status.get('last_message')}")
+    if status.get("state") == "failed":
+        sys.exit(1)
+
+
 def cmd_mcp(args: argparse.Namespace) -> None:
     config_store = ConfigStore(args.config)
     cfg = config_store.get()
@@ -130,7 +165,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="app.py",
-        description="Confluence & Jira Knowledge Graph (lokale Suche & MCP-Server)",
+        description="Confluence, Jira & GitLab Knowledge Graph (lokale Suche & MCP-Server)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -166,6 +201,17 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_parser = subparsers.add_parser("refresh", help="Nur bestehende Dokumente aus Confluence/Jira aktualisieren")
     refresh_parser.add_argument("--config", default=None, help="Pfad zu einer alternativen config.json")
     refresh_parser.set_defaults(func=cmd_refresh)
+
+    # gitlab-sync
+    gitlab_parser = subparsers.add_parser(
+        "gitlab-sync", help="Commits der konfigurierten GitLab-Projekte indexieren (Jira-Keys verknüpfen)")
+    gitlab_parser.add_argument("--full", action="store_true",
+                               help="Vollständiger Scan statt inkrementell ab letztem Stand")
+    gitlab_parser.add_argument("--since", default=None, help="Nur Commits seit JJJJ-MM-TT bzw. 7d/2w")
+    gitlab_parser.add_argument("--max-commits", type=int, default=None,
+                               help="Maximale Anzahl indexierter Commits")
+    gitlab_parser.add_argument("--config", default=None, help="Pfad zu einer alternativen config.json")
+    gitlab_parser.set_defaults(func=cmd_gitlab_sync)
 
     return parser
 

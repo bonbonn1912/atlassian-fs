@@ -120,6 +120,143 @@ den bestehenden Inspektor, Doppelklick lädt das Objekt als Graph-Zentrum. Der
 Wichtigkeits-Modus bleibt zusätzlich verwendbar. Die Flugansicht benötigt WebGL;
 falls es nicht verfügbar ist, bleibt die 2D-Ansicht nutzbar.
 
+#### Such-Ranking: „Score“ und „Wichtigkeit“
+
+Jedes Suchergebnis zeigt zwei Zahlen (`knowledge/search.py`): **Wichtigkeit**
+(`importance_score`) beschreibt, wie gut ein Dokument vernetzt ist, und **Score**
+bestimmt die Reihenfolge der Treffer.
+
+**1. Wichtigkeit** = Anzahl der *unterschiedlichen* Nachbardokumente:
+
+```
+importance(d) = |{ s : Kante s → d, s ≠ d }|  +  |{ t : Kante d → t, t ≠ d }|
+```
+
+- Alle Kantentypen zählen. Mehrere Kanten zum selben Nachbarn in derselben Richtung
+  (z. B. `links_to` und `mentions_jira`) zählen nur einmal; Selbstverweise gar nicht.
+- Ein Nachbar, der in beide Richtungen verknüpft ist, zählt zweimal (einmal eingehend,
+  einmal ausgehend).
+- Nur Confluence-Seiten und Jira-Tickets haben eine Wichtigkeit. GitLab-Commits haben
+  immer `0`.
+- Mit `include_gitlab=false` zählen Verbindungen zu Commits nicht mit.
+
+**2. Wichtigkeits-Faktor** (begrenzt, immer kleiner als 2):
+
+```
+boost(d) = 1 + importance / (10 + importance)
+```
+
+| Wichtigkeit | 0 | 1 | 5 | 10 | 30 | 100 |
+|---|---|---|---|---|---|---|
+| Faktor | 1,00 | 1,09 | 1,33 | 1,50 | 1,75 | 1,91 |
+
+**3. Score** pro Textabschnitt (Chunk) eines Dokuments:
+
+```
+score = bm25 · (1 + 2 · coverage) · boost
+```
+
+- `bm25`: FTS5-BM25-Wert des Chunks (als positive Zahl). Gewichte der Spalten:
+  **Titel 6 · Überschrift 3 · Text 1**, ein Treffer im Titel zählt also sechsmal so viel
+  wie einer im Fließtext.
+- `coverage` (0 … 1): Anteil der *unterschiedlichen* Suchbegriffe, die im Text aus
+  Dokumenttitel + Chunk-Titel + Überschrift + Chunk-Text vorkommen (Teilstring-Vergleich,
+  Groß-/Kleinschreibung egal). Der Faktor `1 + 2 · coverage` liegt zwischen 1 und 3 und
+  bevorzugt Treffer, die *alle* Begriffe enthalten. Ein Issue-Key wie `ENG-42` gilt als
+  gefunden, wenn `eng-42`, `eng 42` oder sowohl `eng` als auch `42` vorkommen.
+- `boost`: der Wichtigkeits-Faktor aus Schritt 2.
+
+Beispiel: BM25 4,0, alle Begriffe gefunden (`coverage` 1), Wichtigkeit 10 →
+`4,0 · 3 · 1,5 = 18,0`.
+
+**Ablauf der Suche:**
+
+1. Die Anfrage wird auf 200 Zeichen gekürzt und in Tokens zerlegt. Die Tokens werden mit
+   `OR` verknüpft, der letzte Begriff ab 3 Zeichen als Präfix (`begriff*`), Issue-Keys als
+   Phrase (`"ENG 42"`).
+2. Vorauswahl: Die 200 Chunks mit dem besten `bm25 · boost` (ohne `coverage`) kommen in
+   die engere Wahl, damit ein stark vernetztes Dokument einen BM25-Gleichstand nicht nur
+   wegen seiner Datenbank-ID verliert.
+3. Pro Dokument zählt der Chunk mit dem höchsten `score`; dieser liefert auch das Snippet.
+4. Sortierung: **zuerst Treffer, deren Jira-Key exakt in der Anfrage steht**, danach
+   `score` absteigend, bei Gleichstand die UID alphabetisch. Ein exakt genannter Key wird
+   auch dann angezeigt, wenn er textlich nicht gefunden wurde (dann `score` 0, Snippet =
+   die ersten 200 Zeichen).
+5. Es werden höchstens 10 Dokumente zurückgegeben.
+
+Die Wichtigkeit kann einen Treffer also höchstens verdoppeln (Faktor < 2), die
+Abdeckung verdreifachen; ein Dokument ohne passenden Text taucht allein wegen vieler
+Verbindungen nie auf.
+
+#### Knotengewichtung im Graph
+
+Die Größe und Position eines Knotens ergibt sich ausschließlich aus seinen Kanten.
+Alle Größen sind Radien in Weltkoordinaten.
+
+**Grundwerte (Server, `knowledge/graph.py`):** Pro Knoten werden alle Kanten aus
+der Tabelle `edges` gezählt, unabhängig vom Kantentyp-Filter der Oberfläche:
+
+```
+out_degree(v) = Anzahl Kanten mit source = v
+in_degree(v)  = Anzahl Kanten mit target = v
+degree(v)     = in_degree(v) + out_degree(v)
+```
+
+Mehrere Kanten zwischen denselben Knoten (verschiedene Typen/Labels) zählen einzeln,
+ein Selbstverweis zählt doppelt. Mit `include_gitlab=false` zählen Kanten zu
+GitLab-Commits nicht mit. Die Zähler beziehen sich auf den gesamten Index, nicht nur
+auf die gerade sichtbaren Knoten.
+
+**Auswahl bei `max_nodes`:** Ohne Zentrum werden die `max_nodes` Knoten mit dem größten
+`degree` angezeigt (Gleichstand: kleinere interne ID zuerst). Mit Zentrum wird pro Hop
+nach `degree` absteigend aufgefüllt, bis das Limit erreicht ist; der Rest wird als
+„ausgeblendet“ gemeldet.
+
+**Radius, Standardmodus (`web/graph.js`, `KnowledgeGraph.radiusFor`):**
+
+```
+r(v) = 7 + min(13, 2.2 · log2(degree(v) + 1))      → 7 … 20
+r(Zentrum) = r + 5
+```
+
+Die Größe wächst logarithmisch: `degree` 0 → 7,0 · 1 → 9,2 · 3 → 11,4 · 10 → 14,6 ·
+ab ca. 60 → 20 (Obergrenze). Das 3D-Fluglayout verwendet dieselbe Formel (ohne
+Zentrum-Zuschlag); dort wird ein ausgewählter Knoten um 5, ein überfahrener um 2
+vergrößert.
+
+**Radius, Wichtigkeits-Modus** (Schalter in der Werkzeugleiste): Hier zählen nur
+eingehende Kanten, linear zwischen dem kleinsten und größten Wert der sichtbaren
+Knoten:
+
+```
+ratio(v) = (in_degree(v) − min_in) / (max_in − min_in)      (min/max über die sichtbaren Knoten)
+r(v)     = 7 + ratio(v) · (35 − 7)                          → 7 … 35, auf 0,1 gerundet
+```
+
+Haben alle sichtbaren Knoten denselben `in_degree`, ist `ratio` in 2D 0,5 und in 3D 0.
+Das Zentrum erhält in diesem Modus keinen Zuschlag.
+
+**Einfluss auf das 2D-Layout (`web/graph-layout-worker.js`):**
+
+- Abstoßung pro Knoten: `−(28 + 6 · r(v))` — größere Knoten stoßen stärker ab.
+- Federn entlang der Kanten: Ruhelänge `r(s) + r(t) + 70`, Stärke `1 / min(deg(s), deg(t))`,
+  wobei `deg` hier die Anzahl der Kanten *innerhalb des sichtbaren Teilgraphen* ist.
+  Die Last verteilt sich nach `deg(s) / (deg(s) + deg(t))` auf die beiden Enden.
+- Schwerkraft zur Mitte: `0,012`; im Wichtigkeits-Modus
+  `0,012 · (0,6 + 2,8 · ratio(v))`, also bis zum 3,4-Fachen für den wichtigsten Knoten.
+  Außerdem starten die Knoten dort nach `in_degree` sortiert spiralförmig von innen nach außen.
+- Das Zentrum bleibt fixiert; zum Schluss werden Überlappungen entfernt.
+- Ab 5001 Knoten werden Cluster gebildet; sie sind nach `in_degree` (Wichtigkeits-Modus)
+  bzw. `deg` sortiert.
+
+**Andere Gewichtungen:**
+
+- *Top-Dokumente* (`/api/top-documents`): Sortierung nach `incoming_count` absteigend,
+  dann `outgoing_count` absteigend, dann ID.
+- *Suche* („Wichtigkeit“ und „Score“ an den Treffern): siehe den Abschnitt
+  „Such-Ranking“ oben. Die Wichtigkeit zählt dort unterschiedliche Nachbarn und
+  unterscheidet sich bewusst von `degree` im Graphen.
+
 ### 8. Spaces auswählen & geänderte Seiten nachziehen
 
 Im Reiter **Einstellungen** gibt es den Abschnitt **Confluence-Spaces & Aktualisierung**:
@@ -165,6 +302,74 @@ Der Crawler lädt Dokumente gebündelt statt einzeln:
   dauerhaft in `title_resolutions` gecacht – Folgeläufe kosten dafür keine Requests mehr.
 - Für maximale Geschwindigkeit bleiben zwei Optionen abschaltbar: „Unterseiten berücksichtigen"
   (Eltern-Kind-Kanten) und „Jira-Remote-Links abrufen" (Jira→Confluence-Kanten).
+
+---
+
+## GitLab Self-Managed und GitLab.com: Commits und Jira-Referenzen
+
+GitLab Self-Managed und GitLab.com können zusätzlich zu Confluence und Jira über eine Basis-URL und einen
+Personal Access Token verbunden werden. In **Einstellungen → GitLab** die Instanz,
+die Projekt-IDs und die gewünschten Issue-Präfixe eintragen, etwa `API, BUG`.
+Der Token benötigt Lesezugriff auf die ausgewählten Projekte und die REST-API
+(`read_api`). Alternativ kann der Token über `GITLAB_TOKEN` gesetzt werden.
+Beide Varianten verwenden die REST-API v4
+([Commits API](https://docs.gitlab.com/api/commits/),
+[Token-Authentifizierung](https://docs.gitlab.com/api/rest/authentication/)).
+
+Für das Projekt [dw191299/bonbot](https://gitlab.com/dw191299/bonbot) lautet die
+Basis-URL `https://gitlab.com` und der Projekteingang `dw191299/bonbot`.
+Für eine interne Installation entsprechend die eigene Basis-URL und den dortigen
+Projektpfad oder die numerische Projekt-ID verwenden.
+
+**Projekte auswählen und Berechtigungen.** Der Token hat genau die Rechte seines
+Users. Nach dem Speichern von Basis-URL und Token listet **Projekte laden** alle
+Projekte, in denen dieser User mindestens *Reporter* ist (`GET /api/v4/projects?membership=true&min_access_level=20`) –
+die niedrigste Rolle, mit der GitLab Commits privater Projekte herausgibt. Angehakte
+Projekte landen im Feld „Projekt-IDs oder Pfade“; eingetragene Projekte ohne Zugriff
+werden als „kein Zugriff / nicht gefunden“ markiert (GitLab antwortet hier mit 404,
+nicht 403). Öffentliche Projekte lassen sich auch ohne Token direkt als Pfad eintragen;
+die Liste selbst benötigt einen Token. Statt eines persönlichen Tokens eignen sich auch
+Project- oder Group-Access-Tokens (Rolle Reporter, Scope `read_api`). Nicht lesbare
+Projekte werden beim Indexieren mit Warnung übersprungen, **Verbindung testen** prüft
+bis zu 50 eingetragene Projekte.
+
+Die GitLab-Indexierung benötigt keine Confluence-Startseite. Über **GitLab-Commits
+indexieren** einen eigenen Lauf starten (`gitlab_only: true`). Standardmäßig werden
+nur Commits mit einem konfigurierten Issue-Key aufgenommen (`require_issue_key`).
+Ohne diese Einschränkung werden auch Commits ohne Issue-Verweis zu eigenständigen
+Knoten. `ref_name` wählt einen Branch/Tag; leer bedeutet den Standardbranch.
+`all_branches` nimmt stattdessen alle Branches auf. `since` begrenzt den Zeitraum.
+Ein vollständiger Lauf merkt sich seinen Fortschritt für die nächste inkrementelle
+Indexierung. Geänderte Präfixe lösen eine erneute Prüfung älterer Commits aus.
+
+Commit-Nachrichten
+werden auf konfigurierte Issue-Keys geprüft: `API-2323 changed this` und
+`BUG-2323 fix this` erzeugen Verbindungen vom Commit zum jeweiligen Jira-Key.
+Existiert das Jira-Issue bereits, wird derselbe Knoten verwendet. Andernfalls bleibt
+es als eigenständige, noch nicht abgerufene Referenz im Graphen erhalten. Ein später
+indexiertes Jira-Issue ergänzt diesen Knoten. Commits werden je Projekt und SHA
+identifiziert, sodass gleiche SHAs in verschiedenen Projekten getrennt bleiben.
+
+Die Standardansicht zeigt nur Confluence. Jira-Issues und GitLab-Commits lassen sich
+separat einblenden. Für einen Graphen nur aus Issues und Commits Confluence abwählen
+und Jira sowie GitLab aktivieren; solche Graphen funktionieren auch ohne eine einzige
+indexierte Confluence-Seite.
+
+MCP-Dokumenttools akzeptieren `include_gitlab` (Boolean, Standard `true`). Mit
+`false` werden Commit-Treffer, Commit-Nachbarn und Traversierungen über Commit-Knoten
+ausgeschlossen. `search_knowledge` unterstützt außerdem `type: "gitlab"`;
+`get_graph_subgraph` unterstützt `types: "jira,gitlab"` für reine Issue-/Commit-Graphen.
+Die globale Indexstatistik beschreibt weiterhin den gesamten Index.
+
+Die Volltextsuche liefert `score` und `importance_score`. Für Confluence und Jira
+zählt die Wichtigkeit unterschiedliche eingehende und ausgehende Nachbarn;
+Selbstverweise und mehrfache Belege derselben Verbindung erhöhen sie nicht.
+Der Suchscore kombiniert BM25 und Token-Abdeckung mit dem Faktor
+`1 + importance_score / (10 + importance_score)` (kleiner als 2).
+Damit werden gut vernetzte, textlich passende Seiten bevorzugt, ohne sachfremde
+Seiten allein wegen ihrer Verbindungen zu Treffern zu machen. Exakte Jira-Keys
+bleiben an erster Stelle. Bei `include_gitlab: false` zählen Commit-Verbindungen
+auch für die Suchgewichtung nicht mit.
 
 ---
 

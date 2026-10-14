@@ -349,3 +349,49 @@ class TestLargeGraph(unittest.TestCase):
             self.assertEqual(len({node['uid'] for node in data['nodes']}), 100000)
         finally:
             conn.close()
+
+
+class TestOverviewCommitClusters(unittest.TestCase):
+    """Overview must show GitLab commits next to many well-linked Jira issues."""
+
+    def setUp(self) -> None:
+        self.conn = db.open_db(":memory:")
+
+        def doc(uid: str, stype: str) -> None:
+            db.save_document(self.conn, models.FetchedDocument(uid, stype, uid, uid, "", uid),
+                             [models.Chunk("", uid)])
+
+        # 60 densely linked Jira hubs, each related to the next 5 issues.
+        for i in range(60):
+            doc(f"jira:HUB-{i}", "jira")
+        for i in range(60):
+            for j in range(1, 6):
+                db.add_edge(self.conn, f"jira:HUB-{i}",
+                            models.LinkTarget(f"jira:HUB-{(i + j) % 60}", "jira_relates_to", f"r{j}"))
+        # Two tickets referenced by commits: X with 3 commits, Y with 1.
+        doc("jira:X-1", "jira")
+        doc("jira:Y-1", "jira")
+        for n, target in enumerate(["jira:X-1"] * 3 + ["jira:Y-1"]):
+            uid = f"gitlab:1:{n:040x}"
+            doc(uid, "gitlab")
+            db.add_edge(self.conn, uid, models.LinkTarget(target, "mentions_jira"))
+
+    def test_commits_and_their_tickets_are_in_the_overview(self) -> None:
+        res = graph.get_subgraph(self.conn, None, max_nodes=20, types="jira,gitlab")
+        uids = {n["uid"] for n in res["nodes"]}
+        self.assertEqual(len(uids), 20)
+        self.assertTrue({"jira:X-1", "jira:Y-1"} <= uids)
+        self.assertEqual(sum(1 for u in uids if u.startswith("gitlab:")), 4)
+        self.assertEqual(sum(1 for e in res["edges"] if e["kind"] == "mentions_jira"), 4)
+        self.assertTrue(res["truncated"])
+
+    def test_cluster_share_is_capped_and_largest_cluster_first(self) -> None:
+        res = graph.get_subgraph(self.conn, None, max_nodes=8, types="jira,gitlab")
+        uids = [n["uid"] for n in res["nodes"]]
+        self.assertIn("jira:X-1", uids)            # X (3 commits) beats Y (1 commit)
+        self.assertNotIn("jira:Y-1", uids)         # 4 + 2 > half of 8
+        self.assertEqual(sum(1 for u in uids if u.startswith("jira:HUB-")), 4)
+
+    def test_without_gitlab_the_ranking_is_unchanged(self) -> None:
+        res = graph.get_subgraph(self.conn, None, max_nodes=20, types="jira", include_gitlab=False)
+        self.assertTrue(all(n["uid"].startswith("jira:HUB-") for n in res["nodes"]))

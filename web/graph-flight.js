@@ -36,6 +36,11 @@
     }
   }
 
+  /** mentions_jira edge from a GitLab commit to a Jira ticket (drawn in green). */
+  function isGitlabJiraEdge(e) {
+    return e.kind === 'mentions_jira' && e.s && e.s.type === 'gitlab';
+  }
+
   function parseColor(str, fallback) {
     if (!str || typeof str !== 'string') return fallback;
     const s = str.trim();
@@ -159,6 +164,16 @@
         const proj = node.project_key || node.project || (node.uid ? node.uid.split(':')[1]?.split('-')[0] : '') || 'Jira';
         key = 'jira:' + proj;
         label = proj;
+      } else if (node.type === 'gitlab') {
+        let proj = node.project || node.project_id;
+        if (!proj && node.uid && node.uid.startsWith('gitlab:')) {
+          const parts = node.uid.split(':');
+          parts.pop();
+          proj = parts.slice(1).join(':');
+        }
+        proj = proj || 'GitLab';
+        key = 'gitlab:' + proj;
+        label = proj;
       }
       if (!clusterMap.has(key)) clusterMap.set(key, { id: key, label, members: [] });
       clusterMap.get(key).members.push(i);
@@ -172,7 +187,9 @@
     for (let i = 0; i < n; i++) {
       const node = nodes[i];
       let timeStr = null;
-      if (node.type === 'jira') {
+      if (node.type === 'gitlab') {
+        timeStr = node.source_updated_at || node.source_created_at || node.committed_date || node.committed_at || node.authored_date || node.updated || node.created;
+      } else if (node.type === 'jira') {
         timeStr = jiraTimeField === 'created' ? (node.created || node.created_at) : (node.updated || node.updated_at || node.created);
       } else {
         timeStr = node.updated || node.last_modified || node.modified || node.created;
@@ -255,6 +272,8 @@
           c.label = `${c.label} (Space)`;
         } else if (c.id.startsWith("jira:")) {
           c.label = `${c.label} (Projekt)`;
+        } else if (c.id.startsWith("gitlab:")) {
+          c.label = `${c.label} (GitLab)`;
         } else if (c.id.startsWith("other")) {
           c.label = `${c.label} (Sonstige)`;
         }
@@ -437,6 +456,7 @@
 
     uniform vec3 u_colorConfluence;
     uniform vec3 u_colorJira;
+    uniform vec3 u_colorGitlab;
     uniform vec3 u_colorDanger;
     uniform vec3 u_colorMuted;
     uniform vec3 u_colorSurface;
@@ -458,11 +478,14 @@
       if (v_type < 0.5) {
         // Confluence: Kreis
         dist = length(p);
-      } else {
+      } else if (v_type < 1.5) {
         // Jira: Abgerundetes Quadrat
         float c = 0.35;
         vec2 q = abs(p) - (1.0 - c);
         dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - (c - 1.0);
+      } else {
+        // GitLab: Raute / Diamond
+        dist = (abs(p.x) + abs(p.y)) * 0.9;
       }
 
       if (dist > 1.0) discard;
@@ -473,7 +496,7 @@
       float borderInner = 1.0 - borderWidth;
       float isBorder = smoothstep(borderInner - aa, borderInner, dist);
 
-      vec3 brandColor = (v_type < 0.5) ? u_colorConfluence : u_colorJira;
+      vec3 brandColor = (v_type < 0.5) ? u_colorConfluence : ((v_type < 1.5) ? u_colorJira : u_colorGitlab);
       vec3 fillColor = brandColor;
       vec3 strokeColor = u_colorSurface;
 
@@ -705,6 +728,7 @@
           u_dpr: gl.getUniformLocation(this.nodeProgram, 'u_dpr'),
           u_colorConfluence: gl.getUniformLocation(this.nodeProgram, 'u_colorConfluence'),
           u_colorJira: gl.getUniformLocation(this.nodeProgram, 'u_colorJira'),
+          u_colorGitlab: gl.getUniformLocation(this.nodeProgram, 'u_colorGitlab'),
           u_colorDanger: gl.getUniformLocation(this.nodeProgram, 'u_colorDanger'),
           u_colorMuted: gl.getUniformLocation(this.nodeProgram, 'u_colorMuted'),
           u_colorSurface: gl.getUniformLocation(this.nodeProgram, 'u_colorSurface'),
@@ -762,6 +786,7 @@
       this._cachedColors = {
         confCol: parseColor(cssVar('--confluence-blue', '#1868db'), [0.09, 0.41, 0.86]),
         jiraCol: parseColor(cssVar('--jira-orange', '#e2740d'), [0.89, 0.45, 0.05]),
+        gitlabCol: parseColor(cssVar('--gitlab-orange', '#fc6d26'), [0.988, 0.427, 0.149]),
         dangerCol: parseColor(cssVar('--status-danger', '#de350b'), [0.87, 0.21, 0.04]),
         mutedCol: parseColor(cssVar('--text-muted', '#7a869a'), [0.48, 0.53, 0.60]),
         surfCol: parseColor(cssVar('--bg-surface', '#ffffff'), [1.0, 1.0, 1.0]),
@@ -1154,6 +1179,8 @@
             c.label = `${c.label} (Space)`;
           } else if (c.id.startsWith("jira:")) {
             c.label = `${c.label} (Projekt)`;
+          } else if (c.id.startsWith("gitlab:")) {
+            c.label = `${c.label} (GitLab)`;
           } else if (c.id.startsWith("other")) {
             c.label = `${c.label} (Sonstige)`;
           }
@@ -1204,7 +1231,7 @@
 
       for (let i = 0; i < n; i++) {
         const node = this.nodes[i];
-        const isJira = node.type === 'jira' ? 1.0 : 0.0;
+        const isType = node.type === 'gitlab' ? 2.0 : (node.type === 'jira' ? 1.0 : 0.0);
         let st = 0.0;
         if (node.state === 'missing' || node.state === 'forbidden' || node.state === 'error') st = 1.0;
         else if (node.state !== 'indexed') st = 2.0;
@@ -1213,7 +1240,7 @@
         const impRatio = ((node.in_degree ?? 0) - minImp) / impSpan;
 
         const off = i * 4;
-        attr[off] = isJira;
+        attr[off] = isType;
         attr[off + 1] = st;
         attr[off + 2] = baseR;
         attr[off + 3] = impRatio;
@@ -1342,14 +1369,26 @@
       const maxSparse = 4000;
       const pos = this.positions;
 
+      const green = parseColor(cssVar('--gitlab-jira-green', '#1f9d55'), [0.12, 0.62, 0.33]);
+      // First pass: always include all GitLab -> Jira edges in green
+      for (let i = 0; i < this.edges.length; i++) {
+        const e = this.edges[i];
+        if (isGitlabJiraEdge(e)) {
+          const sIdx = e.s.idx * 3;
+          const tIdx = e.t.idx * 3;
+          lines.push(pos[sIdx], pos[sIdx + 1], pos[sIdx + 2], green[0], green[1], green[2], 0.75);
+          lines.push(pos[tIdx], pos[tIdx + 1], pos[tIdx + 2], green[0], green[1], green[2], 0.75);
+          count++;
+        }
+      }
+      // Second pass: structural edges up to maxSparse
       for (let i = 0; i < this.edges.length && count < maxSparse; i++) {
         const e = this.edges[i];
+        if (isGitlabJiraEdge(e)) continue;
         if (e.kind === 'parent_of' || e.kind === 'jira_parent_of' || i % 15 === 0) {
           const sIdx = e.s.idx * 3;
           const tIdx = e.t.idx * 3;
-          // Vertex 1: x, y, z, r, g, b, a
           lines.push(pos[sIdx], pos[sIdx + 1], pos[sIdx + 2], 0.48, 0.53, 0.60, 0.22);
-          // Vertex 2
           lines.push(pos[tIdx], pos[tIdx + 1], pos[tIdx + 2], 0.48, 0.53, 0.60, 0.22);
           count++;
         }
@@ -1374,6 +1413,7 @@
       const active = [];
       const pos = this.positions;
       const focusColor = parseColor(cssVar('--border-focus', '#0052cc'), [0, 0.32, 0.8]);
+      const green = parseColor(cssVar('--gitlab-jira-green', '#1f9d55'), [0.12, 0.62, 0.33]);
 
       for (const e of this.edges) {
         const matchNode = this.selectedUid && (e.source === this.selectedUid || e.target === this.selectedUid);
@@ -1381,8 +1421,9 @@
         if (matchNode || matchEdge) {
           const sIdx = e.s.idx * 3;
           const tIdx = e.t.idx * 3;
-          active.push(pos[sIdx], pos[sIdx + 1], pos[sIdx + 2], focusColor[0], focusColor[1], focusColor[2], 0.95);
-          active.push(pos[tIdx], pos[tIdx + 1], pos[tIdx + 2], focusColor[0], focusColor[1], focusColor[2], 0.95);
+          const c = isGitlabJiraEdge(e) ? green : focusColor;
+          active.push(pos[sIdx], pos[sIdx + 1], pos[sIdx + 2], c[0], c[1], c[2], 0.95);
+          active.push(pos[tIdx], pos[tIdx + 1], pos[tIdx + 2], c[0], c[1], c[2], 0.95);
         }
       }
 
@@ -2014,6 +2055,7 @@
       gl.uniform1f(u.u_dpr, this.dpr);
       gl.uniform3fv(u.u_colorConfluence, confCol);
       gl.uniform3fv(u.u_colorJira, jiraCol);
+      gl.uniform3fv(u.u_colorGitlab, colors.gitlabCol || [0.988, 0.427, 0.149]);
       gl.uniform3fv(u.u_colorDanger, dangerCol);
       gl.uniform3fv(u.u_colorMuted, mutedCol);
       gl.uniform3fv(u.u_colorSurface, surfCol);
@@ -2200,7 +2242,7 @@
               metaEl.style.fontSize = '11px';
               const parts = [
                 node.uid,
-                node.type === 'jira' ? 'Jira' : 'Confluence',
+                node.type === 'gitlab' ? 'GitLab' : (node.type === 'jira' ? 'Jira' : 'Confluence'),
                 node.document_type,
                 node.status,
                 node.in_degree !== undefined ? `${node.in_degree} eingehend` : null,

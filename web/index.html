@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lokaler Knowledge Graph · Confluence &amp; Jira</title>
+  <title>Lokaler Knowledge Graph · Confluence, Jira &amp; GitLab</title>
   <link rel="stylesheet" href="style.css">
   <script defer src="graph-layout-worker.js"></script>
   <script defer src="graph.js"></script>
@@ -27,7 +27,7 @@
         </div>
         <div class="brand-text">
           <h1 class="brand-title">Knowledge Graph</h1>
-          <span class="brand-subtitle">Confluence &amp; Jira</span>
+          <span class="brand-subtitle">Confluence, Jira &amp; GitLab</span>
         </div>
       </div>
 
@@ -67,7 +67,7 @@
         <div class="search-view-container" id="search-view-container">
           <div class="search-hero" id="search-hero">
             <h2 class="search-hero-title">Lokale Wissenssuche</h2>
-            <p class="search-hero-desc">Durchsuche lokal indexierte Confluence-Seiten und Jira-Tickets in Echtzeit.</p>
+            <p class="search-hero-desc">Durchsuche lokal indexierte Confluence-Seiten, Jira-Tickets und GitLab-Commits in Echtzeit.</p>
           </div>
 
           <form class="search-form" id="search-form" role="search" novalidate>
@@ -77,7 +77,7 @@
                 <circle cx="11" cy="11" r="8"></circle>
                 <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
               </svg>
-              <input type="search" id="search-input" class="search-input" placeholder="Suchbegriff, Jira-Key (z. B. ENG-42) oder Titel eingeben …" autocomplete="off" spellcheck="false" maxlength="200">
+              <input type="search" id="search-input" class="search-input" placeholder="Suchbegriff, Jira-Key (z. B. ENG-42), Commit-SHA oder Titel eingeben …" autocomplete="off" spellcheck="false" maxlength="200">
               <button type="button" class="search-clear-btn" id="search-clear-btn" hidden aria-label="Suche löschen">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -99,6 +99,9 @@
 
                   <input type="radio" name="search-type" id="search-type-jira" value="jira">
                   <label for="search-type-jira">Jira</label>
+
+                  <input type="radio" name="search-type" id="search-type-gitlab" value="gitlab">
+                  <label for="search-type-gitlab">GitLab</label>
                 </div>
               </div>
 
@@ -133,10 +136,10 @@
           <div class="indexing-header-row">
             <div>
               <h2 class="section-title">Indexierung &amp; Crawl-Verwaltung</h2>
-              <p class="section-desc">Starte und überwache lokale Indexierungs-Jobs für Confluence-Bereiche und Jira-Tickets.</p>
+              <p class="section-desc">Starte und überwache lokale Indexierungs-Jobs für Confluence-Bereiche, Jira-Tickets und GitLab-Commits.</p>
             </div>
             <div class="indexing-header-actions">
-              <button type="button" class="btn btn-secondary" id="job-refresh-existing-btn" title="Aktualisiert nur bereits indexierte Dokumente aus Confluence/Jira">
+              <button type="button" class="btn btn-secondary" id="job-refresh-existing-btn" title="Aktualisiert nur bereits indexierte Dokumente aus Confluence/Jira/GitLab">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="btn-leading-icon"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
                 Bestehende aktualisieren (Refresh existing)
               </button>
@@ -148,7 +151,7 @@
             <div class="stat-card">
               <div class="stat-label">Dokumente gesamt</div>
               <div class="stat-value" id="stat-docs-total">—</div>
-              <div class="stat-subtext" id="stat-docs-breakdown">Confluence: — · Jira: —</div>
+              <div class="stat-subtext" id="stat-docs-breakdown">Confluence: — · Jira: — · GitLab: —</div>
             </div>
             <div class="stat-card">
               <div class="stat-label">Beziehungen (Kanten)</div>
@@ -294,6 +297,13 @@
                   <span class="field-hint">Aktualisiert nur Seiten, die seit diesem Datum geändert wurden (z. B. „letzte Woche“ = Datum von vor 7 Tagen).</span>
                 </div>
               </div>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="job-gitlab-since" class="field-label">GitLab-Commits seit Datum (optional)</label>
+                  <input type="date" id="job-gitlab-since" name="gitlab_since" class="text-input">
+                  <span class="field-hint">Nur Commits nach diesem Datum indexieren.</span>
+                </div>
+              </div>
               </fieldset>
 
               <!-- Group 2: Mengengrenzen -->
@@ -311,9 +321,14 @@
                     <span class="field-hint">Grenze erfolgreicher Ticketabrufe</span>
                   </div>
                   <div class="form-group">
+                    <label for="job-max-gitlab-commits" class="field-label">Max. GitLab-Commits</label>
+                    <input type="number" id="job-max-gitlab-commits" name="max_gitlab_commits" class="number-input">
+                    <span class="field-hint">Grenze erfolgreicher Commit-Abrufe</span>
+                  </div>
+                  <div class="form-group">
                     <label for="job-max-total-documents" class="field-label">Max. Dokumente gesamt</label>
                     <input type="number" id="job-max-total-documents" name="max_total_documents" class="number-input">
-                    <span class="field-hint">Summe beider Typen</span>
+                    <span class="field-hint">Summe aller Dokumenttypen</span>
                   </div>
                   <div class="form-group">
                     <label for="job-max-links-per-document" class="field-label">Max. Links je Dokument</label>
@@ -363,6 +378,11 @@
                     <label for="job-jira-sleep-seconds" class="field-label">Jira-Sleep (s)</label>
                     <input type="number" id="job-jira-sleep-seconds" name="jira_sleep_seconds" class="number-input" step="0.1">
                     <span class="field-hint">Mindestabstand zwischen Jira-Requests</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="job-gitlab-sleep-seconds" class="field-label">GitLab-Sleep (s)</label>
+                    <input type="number" id="job-gitlab-sleep-seconds" name="gitlab_sleep_seconds" class="number-input" step="0.1">
+                    <span class="field-hint">Mindestabstand zwischen GitLab-Requests</span>
                   </div>
                   <div class="form-group">
                     <label for="job-request-timeout-seconds" class="field-label">Request-Timeout (s)</label>
@@ -422,11 +442,16 @@
                     <input type="checkbox" id="job-refresh-existing" name="refresh_existing">
                     <span class="checkbox-label">Bestehende Inhalte aktualisieren</span>
                   </label>
+                  <label class="checkbox-control">
+                    <input type="checkbox" id="job-gitlab-only" name="gitlab_only">
+                    <span class="checkbox-label">Nur GitLab-Commits indexieren (gitlab_only)</span>
+                  </label>
                 </div>
               </fieldset>
 
               <div class="form-actions">
                 <button type="submit" class="btn btn-primary" id="job-start-btn">Indexierung starten</button>
+                <button type="button" class="btn btn-secondary" id="job-gitlab-only-btn" title="Nur GitLab-Commits indexieren">GitLab-Commits indexieren</button>
                 <button type="button" class="btn btn-secondary" id="job-refresh-existing-form-btn" title="Nur vorhandene Dokumente neu abrufen und aktualisieren">Bestehende aktualisieren (Refresh existing)</button>
               </div>
             </form>
@@ -463,14 +488,36 @@
               <input type="number" id="graph-max-nodes-input" class="number-input number-sm" value="5000" min="10" max="100000">
             </div>
 
-            <div class="graph-control-item">
-              <label for="graph-type-filter" class="toolbar-label">Typ:</label>
-              <select id="graph-type-filter" class="select-input select-sm">
-                <option value="all" selected>Alle</option>
-                <option value="confluence">Nur Confluence</option>
-                <option value="jira">Nur Jira</option>
-              </select>
+            <div class="graph-control-item graph-source-toggles" role="group" aria-label="Datenquellen für Graph">
+              <span class="toolbar-label">Quellen:</span>
+              <label class="checkbox-control checkbox-sm graph-source-label" title="Confluence-Seiten einblenden">
+                <input type="checkbox" id="graph-source-confluence" checked>
+                <span>Confluence</span>
+              </label>
+              <label class="checkbox-control checkbox-sm graph-source-label" title="Jira-Tickets einblenden (standardmäßig ausgeblendet)">
+                <input type="checkbox" id="graph-source-jira">
+                <span>Jira</span>
+              </label>
+              <label class="checkbox-control checkbox-sm graph-source-label" title="GitLab-Commits einblenden (standardmäßig ausgeblendet)">
+                <input type="checkbox" id="graph-source-gitlab">
+                <span>GitLab</span>
+              </label>
             </div>
+            <div class="graph-control-item" id="graph-filter-jira-gitlab-container">
+              <label class="checkbox-control checkbox-sm graph-filter-label" id="graph-filter-jira-gitlab-label" title="Nur Jira-Tickets mit verknüpften GitLab-Commits anzeigen">
+                <input type="checkbox" id="graph-filter-jira-gitlab">
+                <span>Nur Tickets mit GitLab</span>
+              </label>
+            </div>
+            <select id="graph-type-filter" class="select-input select-sm" hidden aria-hidden="true">
+              <option value="all">Alle</option>
+              <option value="confluence" selected>Nur Confluence</option>
+              <option value="jira">Nur Jira</option>
+              <option value="gitlab">Nur GitLab</option>
+              <option value="jira,gitlab">Jira &amp; GitLab</option>
+              <option value="confluence,gitlab">Confluence &amp; GitLab</option>
+              <option value="confluence,jira">Confluence &amp; Jira</option>
+            </select>
 
             <div class="graph-toolbar-divider" aria-hidden="true"></div>
 
@@ -564,7 +611,7 @@
               <div id="graph-flight-hud" class="graph-flight-hud" hidden>
                 <div class="graph-flight-time-caption">Vorne neu · hinten alt</div>
                 <div id="graph-flight-status" role="status" aria-live="polite">Raum wird vorbereitet …</div>
-                <div class="graph-flight-date-hint">Confluence: letzte Änderung</div>
+                <div class="graph-flight-date-hint">Confluence: letzte Änderung &middot; GitLab: Commit-Datum</div>
                 <div id="graph-flight-unknown" class="graph-flight-date-hint" hidden></div>
               </div>
               <details id="graph-flight-help" class="graph-flight-help" hidden>
@@ -573,7 +620,7 @@
                 <p>Klick: Details · Doppelklick: als Zentrum laden. Tastatursteuerung ist aktiv, wenn der Raum fokussiert ist.</p>
                 <p>Titel naher Objekte erscheinen beim Vorbeiflug automatisch (max. ~8 im Blickfeld).</p>
                 <p>Zeitachse zeigt Jahreszahlen entlang der Flugrichtung, standardmäßig aus.</p>
-                <p>Seiten bilden Space-Cluster. Verknüpfte Tickets liegen beim Space, weitere Tickets in ihrem Jira-Projekt.</p>
+                <p>Seiten bilden Space-Cluster. Verknüpfte Tickets liegen beim Space, weitere Tickets in ihrem Jira-Projekt. GitLab-Commits bilden eigene Projekt-Cluster.</p>
               </details>
 
               <!-- Graph Legend Overlay -->
@@ -586,6 +633,10 @@
                 <div class="legend-row">
                   <span class="legend-swatch node-jira"></span>
                   <span>Jira (Ticket)</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-swatch node-gitlab"></span>
+                  <span>GitLab (Commit)</span>
                 </div>
                 <div class="legend-row">
                   <span class="legend-swatch node-reference"></span>
@@ -607,6 +658,14 @@
                 <div class="legend-row">
                   <span class="legend-line edge-jira"></span>
                   <span>Jira-Beziehung (orange)</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-line edge-mentions-jira"></span>
+                  <span>Confluence → Jira (mentions_jira)</span>
+                </div>
+                <div class="legend-row">
+                  <span class="legend-line edge-gitlab-jira"></span>
+                  <span>GitLab-Commit → Jira (grün)</span>
                 </div>
               </div>
 
@@ -667,6 +726,9 @@
 
                 <input type="radio" name="top-type" id="top-type-jira" value="jira">
                 <label for="top-type-jira">Jira</label>
+
+                <input type="radio" name="top-type" id="top-type-gitlab" value="gitlab">
+                <label for="top-type-gitlab">GitLab</label>
               </div>
             </div>
 
@@ -902,6 +964,69 @@
                   <input type="password" id="setting-jira-token" class="text-input" autocomplete="off" placeholder="Neues Token eingeben …">
                   <span class="token-status-badge" id="setting-jira-token-status" hidden>Gespeichert</span>
                   <button type="button" class="btn btn-ghost btn-sm" id="setting-jira-token-clear" hidden>Token entfernen</button>
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- GitLab Configuration -->
+            <fieldset class="form-fieldset">
+              <legend class="fieldset-legend">GitLab-Instanz</legend>
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-gitlab-base-url" class="field-label">Basis-URL</label>
+                  <input type="url" id="setting-gitlab-base-url" class="text-input" placeholder="https://gitlab.com oder https://gitlab.intern">
+                  <span class="field-hint">GitLab.com oder self-managed Instanz ohne Slash am Ende.</span>
+                </div>
+                <div class="form-group" id="group-gitlab-token">
+                  <label for="setting-gitlab-token" class="field-label">Personal Access Token (PAT)</label>
+                  <div class="input-with-action">
+                    <input type="password" id="setting-gitlab-token" class="text-input" autocomplete="off" placeholder="Neues Token eingeben …">
+                    <span class="token-status-badge" id="setting-gitlab-token-status" hidden>Gespeichert</span>
+                    <button type="button" class="btn btn-ghost btn-sm" id="setting-gitlab-token-clear" hidden>Token entfernen</button>
+                  </div>
+                  <span class="field-hint">GitLab PAT mit read_api- bzw. api-Berechtigung.</span>
+                </div>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-gitlab-project-ids" class="field-label">Projekt-IDs oder Pfade (kommagetrennt)</label>
+                  <input type="text" id="setting-gitlab-project-ids" class="text-input" placeholder="dw191299/bonbot, 12, 34">
+                  <span class="field-hint">Numerische IDs (z. B. 42) oder Pfade (z. B. dw191299/bonbot) für GitLab.com und self-managed.</span>
+                </div>
+                <div class="form-group">
+                  <label for="setting-gitlab-issue-prefixes" class="field-label">Jira-Issue-Präfixe (kommagetrennt)</label>
+                  <input type="text" id="setting-gitlab-issue-prefixes" class="text-input" placeholder="API, BUG">
+                  <span class="field-hint">Präfixe für Jira-Tickets in Commit-Messages (Standard: API, BUG).</span>
+                </div>
+              </div>
+
+              <div class="form-group gitlab-projects-picker">
+                <span class="field-label">Projekte mit Zugriff auswählen</span>
+                <div class="spaces-toolbar">
+                  <button type="button" class="btn btn-secondary" id="gitlab-projects-load-btn">Projekte laden</button>
+                  <input type="search" id="gitlab-projects-filter" class="text-input spaces-filter" placeholder="Nach Name oder Pfad filtern …" aria-label="GitLab-Projekte filtern">
+                  <span class="spaces-status" id="gitlab-projects-status" aria-live="polite"></span>
+                </div>
+                <div class="spaces-list" id="gitlab-projects-list" role="group" aria-label="GitLab-Projekte mit Zugriff" hidden></div>
+                <span class="field-hint">Listet alle Projekte, in denen der User des <em>gespeicherten</em> Tokens mindestens Reporter ist (nötig, um Commits privater Projekte zu lesen). Angehakte Projekte landen im Feld „Projekt-IDs oder Pfade“ – danach speichern.</span>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-group">
+                  <label for="setting-gitlab-ref-name" class="field-label">Standard-Branch / Ref (optional)</label>
+                  <input type="text" id="setting-gitlab-ref-name" class="text-input" placeholder="main">
+                  <span class="field-hint">Branch-Name oder Tag (leer = Default-Branch des Projekts).</span>
+                </div>
+                <div class="form-group">
+                  <label class="checkbox-control checkbox-margin-top">
+                    <input type="checkbox" id="setting-gitlab-all-branches">
+                    <span class="checkbox-label">Alle Branches durchsuchen (all_branches)</span>
+                  </label>
+                  <label class="checkbox-control checkbox-margin-top">
+                    <input type="checkbox" id="setting-gitlab-require-issue-key" checked>
+                    <span class="checkbox-label">Nur Commits mit passendem Jira-Key indexieren (require_issue_key)</span>
+                  </label>
                 </div>
               </div>
             </fieldset>

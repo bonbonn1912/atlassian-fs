@@ -46,7 +46,27 @@ CONTENT_TYPES: dict[str, str] = {
     ".js": "application/javascript",
 }
 
+# Source filters accepted by /api/graph and /api/top-documents.
+GRAPH_TYPE_FILTERS = ("all", "confluence", "jira", "gitlab",
+                      "jira,gitlab", "confluence,gitlab", "confluence,jira")
+# /version + every configured project (gitlab.MAX_TEST_PROJECTS) + slack.
+GITLAB_TEST_MAX_REQUESTS = 55
+GITLAB_PROJECTS_MAX_REQUESTS = 25
+
 _thread_local = threading.local()
+
+
+def parse_bool_param(params: dict[str, list[str]], name: str, default: bool) -> bool:
+    """Query flag: 1/true/yes/on or 0/false/no/off; ValueError (-> 400) otherwise."""
+    values = params.get(name)
+    if not values or values[0] == "":
+        return default
+    raw = values[0].strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} muss true oder false sein")
 
 
 def get_db_connection(db_path: Path) -> sqlite3.Connection:
@@ -311,6 +331,8 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._handle_api_settings_test, {"POST"}, []
         if path == "/api/spaces":
             return self._handle_api_spaces, {"GET"}, []
+        if path == "/api/gitlab/projects":
+            return self._handle_api_gitlab_projects, {"GET"}, []
         if path == "/api/jobs":
             return self._handle_api_jobs, {"POST"}, []
         if path == "/api/jobs/current":
@@ -368,6 +390,7 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
         defaults = dict(cfg.get("crawl_defaults", {}))
         defaults["confluence_sleep_seconds"] = cfg.get("confluence", {}).get("sleep_seconds", 1.0)
         defaults["jira_sleep_seconds"] = cfg.get("jira", {}).get("sleep_seconds", 1.0)
+        defaults["gitlab_sleep_seconds"] = cfg.get("gitlab", {}).get("sleep_seconds", 0.5)
 
         limits: dict[str, Any] = {}
         for name, spec in config.JOB_FIELD_SPECS.items():
@@ -387,6 +410,7 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
                 "configured": {
                     "confluence": bool(cfg.get("confluence", {}).get("base_url")),
                     "jira": bool(cfg.get("jira", {}).get("base_url")),
+                    "gitlab": not config.gitlab_config_errors(cfg),
                 },
             },
         )
@@ -406,7 +430,7 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if self.server.job_manager.is_running():
-            if any(k in data for k in ("confluence", "jira", "http")):
+            if any(k in data for k in ("confluence", "jira", "gitlab", "http")):
                 self.send_error_json(
                     409,
                     "job_conflict",
@@ -496,7 +520,71 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
                 logger.warning("Jira test_connection Fehler: %s", exc, exc_info=True)
                 result["jira"] = {"ok": False, "message": str(exc)}
 
+        result["gitlab"] = self._test_gitlab(cfg, timeout)
         self.send_json(200, result)
+
+    def _test_gitlab(self, cfg: dict, timeout: float) -> dict:
+        """GitLab connection test with its own small budget; never leaks the token."""
+        gl_cfg = cfg.get("gitlab", {})
+        if not (gl_cfg.get("base_url") or "").strip():
+            return {"ok": False, "message": "Nicht konfiguriert"}
+        from . import atlassian_http, gitlab
+
+        try:
+            rl_client = gitlab.build_gitlab_http(
+                cfg,
+                stop_event=threading.Event(),
+                budget=atlassian_http.RequestBudget(GITLAB_TEST_MAX_REQUESTS, 60.0),
+                sleep_seconds=0.0,
+                timeout=timeout,
+                max_retries=0,
+                transport=getattr(self.server, "gitlab_transport", None),
+            )
+            return gitlab.GitLabClient(rl_client, cfg).test_connection()
+        except Exception as exc:
+            message = atlassian_http.redact_secrets(str(exc), [gl_cfg.get("token") or ""])
+            logger.warning("GitLab test_connection Fehler: %s", message)
+            return {"ok": False, "message": message}
+
+    def _handle_api_gitlab_projects(self, method: str, parsed: urllib.parse.SplitResult) -> None:
+        """Projects the saved GitLab token can read (membership, Reporter or higher)."""
+        cfg = self.server.config_store.get()
+        gl_cfg = cfg.get("gitlab", {})
+        if not (gl_cfg.get("base_url") or "").strip():
+            self.send_error_json(400, "bad_request",
+                                 "GitLab-Basis-URL ist nicht konfiguriert (erst speichern)")
+            return
+        from . import atlassian_http, config as config_mod, gitlab
+
+        token = gl_cfg.get("token") or ""
+        if not str(token).strip():
+            self.send_error_json(400, "bad_request",
+                                 "Zum Laden der Projekte wird ein gespeichertes GitLab-Token benötigt "
+                                 "(öffentliche Projekte lassen sich direkt als Pfad eintragen)")
+            return
+        try:
+            timeout = float(cfg.get("crawl_defaults", {}).get("request_timeout_seconds", 20.0))
+            rl_client = gitlab.build_gitlab_http(
+                cfg,
+                stop_event=threading.Event(),
+                budget=atlassian_http.RequestBudget(GITLAB_PROJECTS_MAX_REQUESTS, 120.0),
+                sleep_seconds=0.0,
+                timeout=timeout,
+                max_retries=1,
+                transport=getattr(self.server, "gitlab_transport", None),
+            )
+            listing = gitlab.GitLabClient(rl_client, cfg).list_accessible_projects()
+        except Exception as exc:
+            message = atlassian_http.redact_secrets(str(exc), [token])
+            logger.warning("GitLab-Projekte konnten nicht geladen werden: %s", message)
+            self.send_error_json(502, "upstream_error",
+                                 f"GitLab-Projekte konnten nicht geladen werden: {message}")
+            return
+        try:
+            configured = config_mod.normalize_gitlab_projects(gl_cfg)
+        except Exception:   # noqa: BLE001 - invalid saved entries are reported elsewhere
+            configured = []
+        self.send_json(200, {**listing, "configured": configured})
 
     def _build_confluence_client(
         self,
@@ -654,6 +742,7 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
         project_param = params.get("project", [None])[0]
         if project_param == "":
             project_param = None
+        include_gitlab = parse_bool_param(params, "include_gitlab", True)
 
         from . import search
 
@@ -661,7 +750,8 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
         search_cfg = self.server.config_store.get().get("search", {})
         res = search.search(conn, q, type=type_param, project=project_param,
                             limit=int(search_cfg.get("max_results", 10)),
-                            max_query_chars=int(search_cfg.get("max_query_chars", 200)))
+                            max_query_chars=int(search_cfg.get("max_query_chars", 200)),
+                            include_gitlab=include_gitlab)
         self.send_json(200, res)
 
     def _handle_api_projects(self, method: str, parsed: urllib.parse.SplitResult) -> None:
@@ -720,6 +810,11 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
         max_nodes = min(max_nodes, max_visible_nodes)
 
         types_param = params.get("types", ["all"])[0] or "all"
+        if types_param not in GRAPH_TYPE_FILTERS:
+            self.send_error_json(400, "bad_request", f"Ungültiger Typ: {types_param}")
+            return
+        include_gitlab = parse_bool_param(params, "include_gitlab", True)
+        only_with_gitlab = parse_bool_param(params, "only_with_gitlab", False) or                            parse_bool_param(params, "only_gitlab_linked", False) or                            parse_bool_param(params, "jira_with_gitlab", False)
         edge_kinds_raw = params.get("edge_kinds", [None])[0]
         edge_kinds = [k.strip() for k in edge_kinds_raw.split(",") if k.strip()] if edge_kinds_raw else None
 
@@ -733,6 +828,8 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
             max_nodes=max_nodes,
             types=types_param,
             edge_kinds=edge_kinds,
+            include_gitlab=include_gitlab,
+            only_with_gitlab=only_with_gitlab,
         )
         self.send_json(200, subgraph)
 
@@ -760,7 +857,7 @@ class KnowledgeRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if "types" in params and params["types"][0]:
             types_param = params["types"][0]
-            if types_param not in ("all", "confluence", "jira"):
+            if types_param not in GRAPH_TYPE_FILTERS:
                 self.send_error_json(400, "bad_request", f"Ungültiger Typ: {types_param}")
                 return
 

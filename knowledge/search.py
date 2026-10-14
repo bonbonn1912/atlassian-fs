@@ -105,24 +105,26 @@ def search(
     project: str | None = None,
     limit: int = 10,
     max_query_chars: int = 200,
+    include_gitlab: bool = True,
 ) -> dict:
-    """Execute a full-text search with BM25 ranking and token coverage bonus.
+    """Execute full-text search with BM25, token coverage and bounded link importance.
 
     Args:
         conn: sqlite3 database connection (read-only safe)
         query: user search string
-        type: document filter: 'all', 'confluence', or 'jira'
+        type: document filter: 'all', 'confluence', 'jira', or 'gitlab'
         project: optional filter by space_or_project
         limit: max documents returned (hard-capped at 10)
         max_query_chars: query string cutoff limit
+        include_gitlab: include commits and their links in results and importance
 
     Returns:
         dict with query, total_returned, duration_ms, and results list
     """
     start_time = time.perf_counter()
 
-    if type not in ("all", "confluence", "jira"):
-        raise ValueError(f"Invalid type: {type!r}; must be one of 'all', 'confluence', 'jira'")
+    if type not in ("all", "confluence", "jira", "gitlab"):
+        raise ValueError(f"Invalid type: {type!r}; must be one of 'all', 'confluence', 'jira', 'gitlab'")
 
     # Hard-cap limit at 10
     effective_limit = max(0, min(int(limit), 10))
@@ -138,9 +140,25 @@ def search(
             "results": [],
         }
 
-    # Query candidate chunks up to 200
-    sql_base = """
+    # Count distinct neighbours rather than duplicate edge evidence; ignore self-links.
+    # The bounded bonus keeps textual relevance decisive (at most a 2x multiplier).
+    edge_filter = "" if include_gitlab else " AND n.source_type != 'gitlab'"
+    degree_sql = f"""(
+        (SELECT COUNT(DISTINCT e.source_doc) FROM edges e
+         JOIN documents n ON n.id=e.source_doc
+         WHERE e.target_doc=d.id AND e.source_doc != d.id {edge_filter}) +
+        (SELECT COUNT(DISTINCT e.target_doc) FROM edges e
+         JOIN documents n ON n.id=e.target_doc
+         WHERE e.source_doc=d.id AND e.target_doc != d.id {edge_filter})
+    )"""
+    importance_sql = f"CASE WHEN d.source_type IN ('confluence','jira') THEN {degree_sql} ELSE 0 END"
+    boost_sql = f"(1.0 + 1.0 * ({importance_sql}) / (10.0 + ({importance_sql})))"
+
+    # Apply importance before the candidate cap, so a hub cannot lose a BM25 tie
+    # solely because its row ID is beyond the first 200 matching chunks.
+    sql_base = f"""
         SELECT c.document_id, c.id AS chunk_id,
+               {importance_sql} AS importance,
                bm25(chunks_fts, 6.0, 3.0, 1.0) AS relevance,
                snippet(chunks_fts, 2, '\x02', '\x03', ' … ', 24) AS excerpt,
                snippet(chunks_fts, -1, '\x02', '\x03', ' … ', 24) AS full_excerpt,
@@ -154,6 +172,9 @@ def search(
     """
     params: list[Any] = [fts_query]
 
+    if not include_gitlab:
+        sql_base += " AND d.source_type != 'gitlab'"
+
     if type != "all":
         sql_base += " AND d.source_type = ?"
         params.append(type)
@@ -162,7 +183,7 @@ def search(
         sql_base += " AND d.space_or_project = ?"
         params.append(project)
 
-    sql_base += " ORDER BY relevance ASC, c.document_id ASC LIMIT 200"
+    sql_base += f" ORDER BY bm25(chunks_fts, 6.0, 3.0, 1.0) * {boost_sql} ASC, c.document_id ASC LIMIT 200"
 
     try:
         cur = conn.execute(sql_base, params)
@@ -197,7 +218,8 @@ def search(
 
         chunk_text = f"{row['chunk_title'] or ''} {row['chunk_heading'] or ''} {row['chunk_body'] or ''}"
         coverage = _calculate_token_coverage(f"{row['title'] or ''} {chunk_text}", raw_tokens)
-        score = bm25_positive * (1.0 + 2.0 * coverage)
+        importance = int(row["importance"])
+        score = bm25_positive * (1.0 + 2.0 * coverage) * (1.0 + importance / (10.0 + importance))
 
         if doc_uid not in best_chunks_by_doc or score > best_chunks_by_doc[doc_uid]["score"]:
             plain_snip, snip_parts = _parse_snippet(raw_snippet)
@@ -214,6 +236,7 @@ def search(
                 "status": row["status_label"],
                 "document_type": row["document_type"],
                 "score": score,
+                "importance_score": importance,
             }
 
     # Guarantee exact issue key Jira documents are included and prioritized
@@ -222,7 +245,7 @@ def search(
             jira_uid = f"jira:{key}"
             if jira_uid not in best_chunks_by_doc:
                 # Check if this exact indexed jira document exists in the database
-                check_sql = "SELECT * FROM documents WHERE uid = ? AND state = 'indexed'"
+                check_sql = f"SELECT d.*, {importance_sql} AS importance FROM documents d WHERE uid = ? AND state = 'indexed'"
                 check_params: list[Any] = [jira_uid]
                 if type != "all":
                     check_sql += " AND source_type = ?"
@@ -246,7 +269,8 @@ def search(
                         "updated_at": doc_row["source_updated_at"],
                         "status": doc_row["status_label"],
                         "document_type": doc_row["document_type"],
-                        "score": 999999.0,
+                        "score": 0.0,
+                        "importance_score": int(doc_row["importance"]),
                     }
 
     # Sorting:
@@ -264,10 +288,12 @@ def search(
     sorted_docs = sorted(best_chunks_by_doc.values(), key=sort_key)
     final_results = sorted_docs[:effective_limit]
 
-    # Clean internal score and source_id fields from public output
+    # Expose ranking and importance, but keep internal source_id out of the response.
     cleaned_results = []
     for item in final_results:
         cleaned_results.append({
+            "score": item["score"],
+            "importance_score": item.get("importance_score", 0),
             "uid": item["uid"],
             "type": item["type"],
             "title": item["title"],

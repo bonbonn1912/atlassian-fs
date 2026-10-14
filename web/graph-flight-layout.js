@@ -86,6 +86,15 @@
     return null;
   }
 
+  function extractProjectFromGitlabUid(uid) {
+    if (typeof uid === 'string' && uid.startsWith('gitlab:')) {
+      const parts = uid.split(':');
+      parts.pop(); // remove commit sha
+      return parts.slice(1).join(':') || null;
+    }
+    return null;
+  }
+
   function build(data, options) {
     const rawNodes = (data && data.nodes) ? data.nodes : [];
     const rawEdges = (data && data.edges) ? data.edges : [];
@@ -98,6 +107,7 @@
 
     // 1. Classify nodes and parse timestamps
     const timestamps = new Float64Array(n);
+    const isGitlab = new Uint8Array(n);
     const isJira = new Uint8Array(n);
     const isConf = new Uint8Array(n);
     const nodeSpaces = new Array(n);
@@ -122,14 +132,23 @@
       const uidStr = typeof node.uid === 'string' ? node.uid : '';
       const typeStr = typeof node.type === 'string' ? node.type.toLowerCase() : '';
 
-      const jira = typeStr === 'jira' || uidStr.startsWith('jira:');
-      const conf = typeStr === 'confluence' || uidStr.startsWith('confluence:');
+      const gitlab = typeStr === 'gitlab' || uidStr.startsWith('gitlab:');
+      const jira = !gitlab && (typeStr === 'jira' || uidStr.startsWith('jira:'));
+      const conf = !gitlab && !jira && (typeStr === 'confluence' || uidStr.startsWith('confluence:') || (!typeStr && !uidStr.startsWith('jira:') && !uidStr.startsWith('gitlab:')));
 
+      isGitlab[i] = gitlab ? 1 : 0;
       isJira[i] = jira ? 1 : 0;
       isConf[i] = conf ? 1 : 0;
 
       // Determine space/project
-      if (conf) {
+      if (gitlab) {
+        const p = (typeof node.project === 'string' && node.project.trim()) ||
+                  (typeof node.project_id === 'string' && node.project_id.trim()) ||
+                  (typeof node.space_or_project === 'string' && node.space_or_project.trim()) ||
+                  extractProjectFromGitlabUid(node.uid) ||
+                  'default';
+        nodeSpaces[i] = p;
+      } else if (conf) {
         const s = (typeof node.space === 'string' && node.space.trim()) ||
                   (typeof node.project === 'string' && node.project.trim()) ||
                   (typeof node.space_key === 'string' && node.space_key.trim()) ||
@@ -151,7 +170,14 @@
 
       // Parse timestamp
       let rawTime;
-      if (jira) {
+      if (gitlab) {
+        rawTime = node.source_updated_at !== undefined ? node.source_updated_at :
+                 (node.source_created_at !== undefined ? node.source_created_at :
+                 (node.committed_date !== undefined ? node.committed_date :
+                 (node.committed_at !== undefined ? node.committed_at :
+                 (node.authored_date !== undefined ? node.authored_date :
+                 (node.updated_at !== undefined ? node.updated_at : node.created_at)))));
+      } else if (jira) {
         if (jiraTimeField === 'created') {
           rawTime = node.source_created_at !== undefined ? node.source_created_at : node.created_at;
         } else {
@@ -265,6 +291,10 @@
           clusterId = 'jira:' + proj;
           clusterLabel = proj;
         }
+      } else if (isGitlab[i]) {
+        const proj = nodeSpaces[i];
+        clusterId = 'gitlab:' + proj;
+        clusterLabel = proj;
       } else {
         const proj = nodeSpaces[i];
         clusterId = 'other:' + proj;
@@ -313,6 +343,8 @@
           c.label = `${c.label} (Space)`;
         } else if (c.id.startsWith('jira:')) {
           c.label = `${c.label} (Projekt)`;
+        } else if (c.id.startsWith('gitlab:')) {
+          c.label = `${c.label} (GitLab)`;
         } else if (c.id.startsWith('other:')) {
           c.label = `${c.label} (Sonstige)`;
         }

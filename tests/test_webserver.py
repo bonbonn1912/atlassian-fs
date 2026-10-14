@@ -580,6 +580,12 @@ class TestWebServer(unittest.TestCase):
         uids = [n["uid"] for n in res["nodes"]]
         self.assertIn("jira:ENG-1", uids)
 
+        # only_with_gitlab filter
+        status, _, body = self.make_request("GET", "/api/graph?only_with_gitlab=true")
+        self.assertEqual(status, 200)
+        res_gitlab = json.loads(body.decode("utf-8"))
+        self.assertIn("nodes", res_gitlab)
+
         # Invalid hops -> 400
         status, _, body = self.make_request("GET", "/api/graph?hops=abc")
         self.assertEqual(status, 400)

@@ -97,7 +97,7 @@
     }));
   }
 
-  const TYPE_LABEL = { confluence: 'Confluence', jira: 'Jira' };
+  const TYPE_LABEL = { confluence: 'Confluence', jira: 'Jira', gitlab: 'GitLab' };
   const STATE_LABEL = {
     discovered: 'Referenz (nicht indexiert)', indexed: 'Indexiert', skipped: 'Übersprungen',
     missing: 'Nicht gefunden', forbidden: 'Kein Zugriff', error: 'Fehler',
@@ -238,11 +238,11 @@
       return null;
     }
     const s = state.stats;
-    const indexed = (s.indexed?.confluence || 0) + (s.indexed?.jira || 0);
+    const indexed = (s.indexed?.confluence || 0) + (s.indexed?.jira || 0) + (s.indexed?.gitlab || 0);
     $('header-doc-count').textContent = `${fmtNum(indexed)} Dokumente indexiert`;
     $('stat-docs-total').textContent = fmtNum(indexed);
     $('stat-docs-breakdown').textContent =
-      `Confluence: ${fmtNum(s.indexed?.confluence || 0)} · Jira: ${fmtNum(s.indexed?.jira || 0)} · ` +
+      `Confluence: ${fmtNum(s.indexed?.confluence || 0)} · Jira: ${fmtNum(s.indexed?.jira || 0)} · GitLab: ${fmtNum(s.indexed?.gitlab || 0)} · ` +
       `Knoten gesamt: ${fmtNum(s.documents_total || 0)}`;
     $('stat-edges-total').textContent = fmtNum(s.edges_total || 0);
     const kinds = Object.entries(s.edges_by_kind || {})
@@ -365,7 +365,7 @@
       meta.hidden = true;
       clear(status);
       await loadStats();
-      if (state.stats && (state.stats.indexed?.confluence || 0) + (state.stats.indexed?.jira || 0) === 0) {
+      if (state.stats && (state.stats.indexed?.confluence || 0) + (state.stats.indexed?.jira || 0) + (state.stats.indexed?.gitlab || 0) === 0) {
         status.appendChild(el('div', { className: 'empty-state-card' }, [
           el('div', { className: 'empty-state-title', text: 'Der lokale Index ist noch leer.' }),
           el('p', {}, ['Starte eine ', el('a', { text: 'Indexierung', attrs: { href: '#index' } }),
@@ -381,6 +381,7 @@
     const seq = ++searchSeq;
     const qs = new URLSearchParams({ q, type });
     if (project) qs.set('project', project);
+    if (type === 'all' || type === 'gitlab') qs.set('include_gitlab', 'true');
     let data;
     try {
       data = await api('GET', `/api/search?${qs}`);
@@ -437,6 +438,14 @@
     if (r.document_type) tags.appendChild(el('span', { className: 'meta-chip', text: r.document_type }));
     if (r.status) tags.appendChild(el('span', { className: 'meta-chip meta-chip-status', text: r.status }));
     if (r.updated_at) tags.appendChild(el('span', { className: 'meta-chip', text: `Aktualisiert ${formatDate(r.updated_at)}` }));
+    if (typeof r.score === 'number') {
+      const scoreStr = Number.isInteger(r.score) ? r.score : r.score.toFixed(2);
+      tags.appendChild(el('span', { className: 'meta-chip meta-chip-score', text: `Score: ${scoreStr}` }));
+    }
+    if (typeof r.importance_score === 'number') {
+      const impStr = Number.isInteger(r.importance_score) ? r.importance_score : r.importance_score.toFixed(2);
+      tags.appendChild(el('span', { className: 'meta-chip meta-chip-importance', text: `Wichtigkeit: ${impStr}` }));
+    }
     const graphLink = el('a', {
       className: 'result-graph-link',
       text: 'Im Graph anzeigen →',
@@ -449,14 +458,14 @@
   // ------------------------------------------------------------------ indexing
 
   const JOB_FORM_FIELDS = [
-    'start_page', 'space_key', 'space_keys', 'modified_since',
-    'max_confluence_pages', 'max_jira_issues', 'max_total_documents', 'max_links_per_document',
+    'start_page', 'space_key', 'space_keys', 'modified_since', 'gitlab_since',
+    'max_confluence_pages', 'max_jira_issues', 'max_gitlab_commits', 'max_total_documents', 'max_links_per_document',
     'max_api_requests', 'max_duration_minutes', 'max_confluence_depth', 'max_jira_link_hops',
-    'confluence_sleep_seconds', 'jira_sleep_seconds', 'request_timeout_seconds', 'max_retries',
+    'confluence_sleep_seconds', 'jira_sleep_seconds', 'gitlab_sleep_seconds', 'request_timeout_seconds', 'max_retries',
     'batch_fetch_size',
     'include_child_pages', 'follow_confluence_links', 'index_linked_jira_issues', 'follow_jira_issue_links',
     'follow_jira_to_confluence', 'scan_plain_text_issue_keys', 'include_remote_links', 'resolve_page_titles',
-    'refresh_existing',
+    'refresh_existing', 'gitlab_only',
   ];
   const fieldEl = (name) => $(`job-${name.replace(/_/g, '-')}`);
   let jobFormFilled = false;
@@ -483,6 +492,10 @@
           continue;
         }
         if (name === 'modified_since') {
+          if (!input.value) input.value = defaults[name] || '';
+          continue;
+        }
+        if (name === 'gitlab_since') {
           if (!input.value) input.value = defaults[name] || '';
           continue;
         }
@@ -528,7 +541,7 @@
         payload[name] = raw.split(/[\s,;]+/).map((v) => v.trim()).filter(Boolean);
         continue;
       }
-      if (name === 'modified_since') {
+      if (name === 'modified_since' || name === 'gitlab_since') {
         payload[name] = raw;
         continue;
       }
@@ -543,7 +556,7 @@
       payload[name] = num;
     }
     const hasSpaceSelection = Array.isArray(payload.space_keys) && payload.space_keys.length > 0;
-    if (!allowMissingStartPage && !payload.start_page && !payload.space_key
+    if (!allowMissingStartPage && !payload.gitlab_only && !payload.start_page && !payload.space_key
         && !payload.modified_since && !hasSpaceSelection) {
       errors.push('Bitte eine Confluence-Start-URL / Page-ID, einen Space-Key, '
         + 'eine Space-Auswahl oder ein Änderungsdatum angeben.');
@@ -614,6 +627,36 @@
     const refFormBtn = $('job-refresh-existing-form-btn');
     if (refFormBtn) {
       refFormBtn.addEventListener('click', triggerRefreshExisting);
+    }
+
+    const gitlabOnlyBtn = $('job-gitlab-only-btn');
+    if (gitlabOnlyBtn) {
+      gitlabOnlyBtn.addEventListener('click', async () => {
+        const fb = $('indexing-feedback');
+        const checkbox = $('job-gitlab-only');
+        if (checkbox) checkbox.checked = true;
+        const { payload, errors } = collectJobForm({ allowMissingStartPage: true });
+        if (errors.length) {
+          showFeedback(fb, errors.join(' · '), 'error');
+          return;
+        }
+        payload.gitlab_only = true;
+        const startBtn = $('job-start-btn');
+        const refHeaderBtn = $('job-refresh-existing-btn');
+        const refFBtn = $('job-refresh-existing-form-btn');
+        if (startBtn) startBtn.disabled = true;
+        if (refHeaderBtn) refHeaderBtn.disabled = true;
+        if (refFBtn) refFBtn.disabled = true;
+        gitlabOnlyBtn.disabled = true;
+        try {
+          const res = await api('POST', '/api/jobs', payload);
+          showFeedback(fb, `GitLab-Indexierungs-Job #${res.job_id} gestartet.`, 'success');
+          await pollJob();
+        } catch (err) {
+          showFeedback(fb, err.message, 'error');
+          updateJobButtons();
+        }
+      });
     }
 
     // "Save as defaults" persists the current form as crawl_defaults.
@@ -716,6 +759,10 @@
     if (refFormBtn) {
       refFormBtn.disabled = active;
     }
+    const gitlabOnlyBtn = $('job-gitlab-only-btn');
+    if (gitlabOnlyBtn) {
+      gitlabOnlyBtn.disabled = active;
+    }
     const stop = $('job-stop-btn');
     if (stop) {
       stop.disabled = !active || state.job.state === 'stopping';
@@ -812,6 +859,59 @@
 
   // ------------------------------------------------------------------ graph
 
+  function getCanonicalGraphTypes(conf, jira, gitlab) {
+    if (conf && jira && gitlab) return 'all';
+    if (conf && !jira && !gitlab) return 'confluence';
+    if (!conf && jira && !gitlab) return 'jira';
+    if (!conf && !jira && gitlab) return 'gitlab';
+    if (!conf && jira && gitlab) return 'jira,gitlab';
+    if (conf && !jira && gitlab) return 'confluence,gitlab';
+    if (conf && jira && !gitlab) return 'confluence,jira';
+    return 'confluence';
+  }
+
+  function parseGraphTypes(typesParam) {
+    if (!typesParam) {
+      return { confluence: true, jira: false, gitlab: false };
+    }
+    const str = typesParam.trim().toLowerCase();
+    if (str === 'all') {
+      return { confluence: true, jira: true, gitlab: true };
+    }
+    const parts = str.split(',').map((s) => s.trim());
+    const hasConf = parts.includes('confluence');
+    const hasJira = parts.includes('jira');
+    const hasGitlab = parts.includes('gitlab');
+    if (!hasConf && !hasJira && !hasGitlab) {
+      return { confluence: true, jira: false, gitlab: false };
+    }
+    return { confluence: hasConf, jira: hasJira, gitlab: hasGitlab };
+  }
+
+  function syncGraphSourceToggles(typesParam) {
+    const { confluence, jira, gitlab } = parseGraphTypes(typesParam);
+    const confEl = $('graph-source-confluence');
+    const jiraEl = $('graph-source-jira');
+    const glEl = $('graph-source-gitlab');
+    if (confEl) confEl.checked = confluence;
+    if (jiraEl) jiraEl.checked = jira;
+    if (glEl) glEl.checked = gitlab;
+    const canonical = getCanonicalGraphTypes(confluence, jira, gitlab);
+    const select = $('graph-type-filter');
+    if (select) select.value = canonical;
+    return canonical;
+  }
+
+  function getActiveGraphTypes() {
+    const conf = $('graph-source-confluence') ? $('graph-source-confluence').checked : true;
+    const jira = $('graph-source-jira') ? $('graph-source-jira').checked : false;
+    const gitlab = $('graph-source-gitlab') ? $('graph-source-gitlab').checked : false;
+    if (!conf && !jira && !gitlab) {
+      return 'confluence';
+    }
+    return getCanonicalGraphTypes(conf, jira, gitlab);
+  }
+
   const EDGE_KINDS = ['links_to', 'parent_of', 'mentions_jira', 'jira_relates_to', 'jira_parent_of', 'links_to_confluence'];
 
   function initGraph() {
@@ -870,7 +970,37 @@
     const reload = () => { state.graphLoadedKey = null; routeGraph(parseHash().params); };
     hopsSel.addEventListener('change', reload);
     maxNodes.addEventListener('change', reload);
-    $('graph-type-filter').addEventListener('change', reload);
+    const syncAndReload = () => {
+      const canonical = getActiveGraphTypes();
+      const select = $('graph-type-filter');
+      if (select) select.value = canonical;
+      reload();
+    };
+    const confToggle = $('graph-source-confluence');
+    if (confToggle) confToggle.addEventListener('change', syncAndReload);
+    const jiraToggle = $('graph-source-jira');
+    if (jiraToggle) jiraToggle.addEventListener('change', syncAndReload);
+    const gitlabToggle = $('graph-source-gitlab');
+    if (gitlabToggle) gitlabToggle.addEventListener('change', syncAndReload);
+    const jiraGitlabFilter = $('graph-filter-jira-gitlab');
+    if (jiraGitlabFilter) {
+      jiraGitlabFilter.addEventListener('change', () => {
+        if (jiraGitlabFilter.checked) {
+          const jiraToggle = $('graph-source-jira');
+          const gitlabToggle = $('graph-source-gitlab');
+          if (jiraToggle && !jiraToggle.checked) jiraToggle.checked = true;
+          if (gitlabToggle && !gitlabToggle.checked) gitlabToggle.checked = true;
+          const canonical = getActiveGraphTypes();
+          const select = $('graph-type-filter');
+          if (select) select.value = canonical;
+        }
+        reload();
+      });
+    }
+    $('graph-type-filter').addEventListener('change', () => {
+      syncGraphSourceToggles($('graph-type-filter').value);
+      reload();
+    });
     EDGE_KINDS.forEach((k) => $(`edge-filter-${k}`).addEventListener('change', () => {
       $('edge-filters-active-count').textContent = String(selectedEdgeKinds().length);
       reload();
@@ -1016,9 +1146,24 @@
     if (focus) $('graph-center-input').value = focus;
     const hops = $('graph-hops-select').value;
     const maxNodes = $('graph-max-nodes-input').value || '5000';
-    const types = $('graph-type-filter').value;
+    let types = params.get('types');
+    if (types) {
+      types = syncGraphSourceToggles(types);
+    } else {
+      types = getActiveGraphTypes();
+      const select = $('graph-type-filter');
+      if (select) select.value = types;
+    }
+    const jiraGitlabFilter = $('graph-filter-jira-gitlab');
+    const paramGitlabOnly = params.get('only_with_gitlab') || params.get('jira_with_gitlab');
+    if (paramGitlabOnly !== null && jiraGitlabFilter) {
+      jiraGitlabFilter.checked = paramGitlabOnly === 'true' || paramGitlabOnly === '1';
+    }
+    const isOnlyWithGitlab = !!jiraGitlabFilter?.checked;
     const kinds = selectedEdgeKinds();
     const qs = new URLSearchParams({ hops, max_nodes: maxNodes, types });
+    qs.set('include_gitlab', types === 'all' || types.includes('gitlab') ? 'true' : 'false');
+    if (isOnlyWithGitlab) qs.set('only_with_gitlab', 'true');
     if (focus) qs.set('center', focus);
     if (kinds.length !== EDGE_KINDS.length) qs.set('edge_kinds', kinds.join(','));
     const key = qs.toString();
@@ -1121,7 +1266,7 @@
     }
     if (seq !== inspectSeq) return;
     clear(details);
-    const docType = doc.type || doc.source_type || (doc.uid?.startsWith('jira:') ? 'jira' : 'confluence');
+    const docType = doc.type || doc.source_type || (doc.uid?.startsWith('gitlab:') ? 'gitlab' : (doc.uid?.startsWith('jira:') ? 'jira' : 'confluence'));
     const projectOrSpace = doc.project || doc.space_or_project || doc.space;
     const statusLabel = doc.status || doc.status_label;
     $('inspector-title').textContent = TYPE_LABEL[docType] || 'Dokument';
@@ -1139,7 +1284,7 @@
     const props = el('div', { className: 'inspector-props-list' }, [
       prop('UID', doc.uid),
       prop('Zustand', STATE_LABEL[doc.state] || doc.state),
-      prop(docType === 'jira' ? 'Projekt' : 'Space', projectOrSpace),
+      prop(docType === 'jira' || docType === 'gitlab' ? 'Projekt' : 'Space', projectOrSpace),
       prop('Typ', doc.document_type),
       prop('Status', statusLabel),
       prop('Labels', (doc.labels || []).join(', ')),
@@ -1220,8 +1365,9 @@
 
   function getTopFilters() {
     let types = 'all';
-    if ($('top-type-confluence').checked) types = 'confluence';
-    else if ($('top-type-jira').checked) types = 'jira';
+    if ($('top-type-confluence')?.checked) types = 'confluence';
+    else if ($('top-type-jira')?.checked) types = 'jira';
+    else if ($('top-type-gitlab')?.checked) types = 'gitlab';
 
     const project = $('top-project-select').value.trim();
     const limit = parseInt($('top-limit-select').value, 10) || 50;
@@ -1262,6 +1408,7 @@
   async function loadTopDocuments() {
     const { types, project, limit, q } = getTopFilters();
     const qs = new URLSearchParams({ types, limit: String(limit), offset: '0' });
+    if (types === 'all' || types.includes('gitlab')) qs.set('include_gitlab', 'true');
     if (project) qs.set('project', project);
     if (q) qs.set('q', q);
 
@@ -1393,6 +1540,12 @@
     ['setting-jira-aliases', 'jira', 'aliases', 'lines'],
     ['setting-jira-project-keys', 'jira', 'project_keys', 'csv'],
     ['setting-jira-sleep-seconds', 'jira', 'sleep_seconds', 'float'],
+    ['setting-gitlab-base-url', 'gitlab', 'base_url', 'text'],
+    ['setting-gitlab-project-ids', 'gitlab', 'project_ids', 'csv'],
+    ['setting-gitlab-issue-prefixes', 'gitlab', 'issue_prefixes', 'csv'],
+    ['setting-gitlab-ref-name', 'gitlab', 'ref_name', 'text'],
+    ['setting-gitlab-all-branches', 'gitlab', 'all_branches', 'bool'],
+    ['setting-gitlab-require-issue-key', 'gitlab', 'require_issue_key', 'bool'],
     ['setting-http-verify-ssl', 'http', 'verify_ssl', 'bool'],
     ['setting-http-ca-bundle', 'http', 'ca_bundle', 'text'],
     ['setting-http-use-system-proxy', 'http', 'use_system_proxy', 'bool'],
@@ -1415,7 +1568,7 @@
     ['setting-db-path', 'database', 'path', 'text'],
   ];
   const SOURCES = ['confluence', 'jira'];
-  const pendingTokenClear = { confluence: false, jira: false };
+  const pendingTokenClear = { confluence: false, jira: false, gitlab: false };
 
   // Selected Confluence spaces (checkbox list in the settings tab)
   let selectedSpaces = new Set();
@@ -1523,6 +1676,121 @@
     }
   }
 
+  // ------------------------------------------------------------------ GitLab project picker
+  // The "Projekt-IDs oder Pfade" field stays the single source of truth; the
+  // checkbox list only adds/removes entries there.
+
+  function gitlabProjectEntries() {
+    const input = $('setting-gitlab-project-ids');
+    return input ? input.value.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  }
+
+  function normalizeGitlabEntry(entry) {
+    let ref = entry.trim();
+    if (/^https?:\/\//i.test(ref)) {
+      try {
+        let path = decodeURIComponent(new URL(ref).pathname);
+        const baseInput = $('setting-gitlab-base-url');
+        const basePath = baseInput && baseInput.value ? new URL(baseInput.value).pathname.replace(/\/+$/, '') : '';
+        if (basePath && path.startsWith(`${basePath}/`)) path = path.slice(basePath.length);
+        ref = path.split('/-/')[0].replace(/\.git$/, '');
+      } catch (_) { /* invalid URL: compare as typed */ }
+    }
+    return ref.replace(/^\/+|\/+$/g, '').toLowerCase();
+  }
+
+  function gitlabProjectSelected(project) {
+    const keys = new Set([project.path.toLowerCase(), String(project.id)]);
+    return gitlabProjectEntries().some((e) => keys.has(normalizeGitlabEntry(e)));
+  }
+
+  function toggleGitlabProject(project, on) {
+    const keys = new Set([project.path.toLowerCase(), String(project.id)]);
+    const entries = gitlabProjectEntries().filter((e) => !keys.has(normalizeGitlabEntry(e)));
+    if (on) entries.push(project.path);
+    $('setting-gitlab-project-ids').value = entries.join(', ');
+    updateGitlabProjectsStatus();
+  }
+
+  function setGitlabProjectsStatus(text, isError) {
+    const node = $('gitlab-projects-status');
+    if (!node) return;
+    node.textContent = text || '';
+    node.classList.toggle('is-error', !!isError);
+  }
+
+  function updateGitlabProjectsStatus() {
+    const all = state.gitlabProjects;
+    if (!all) return;
+    const selected = all.filter(gitlabProjectSelected).length;
+    let text = `${all.length} Projekt(e) mit Zugriff · ${selected} ausgewählt`;
+    if (state.gitlabProjectsTruncated) text += ' · Liste gekürzt, ggf. filtern';
+    setGitlabProjectsStatus(text, false);
+  }
+
+  function gitlabProjectRow(project, unknown) {
+    const checkbox = el('input', { attrs: { type: 'checkbox', autocomplete: 'off' } });
+    checkbox.checked = unknown || gitlabProjectSelected(project);
+    checkbox.addEventListener('change', () => {
+      toggleGitlabProject(project, checkbox.checked);
+      if (unknown) renderGitlabProjectsList();
+    });
+    const badges = [];
+    if (unknown) {
+      badges.push(el('span', { className: 'space-type', text: 'kein Zugriff / nicht gefunden' }));
+    } else {
+      if (project.visibility) badges.push(el('span', { className: 'space-type', text: project.visibility }));
+      badges.push(el('span', { className: 'space-key gitlab-project-id', text: `#${project.id}` }));
+    }
+    return el('label', { className: 'space-item', attrs: { title: project.name || project.path } }, [
+      checkbox,
+      el('span', { className: 'space-name', text: project.path }),
+      el('span', { className: 'space-badges' }, badges),
+    ]);
+  }
+
+  function renderGitlabProjectsList() {
+    const box = $('gitlab-projects-list');
+    if (!box || !state.gitlabProjects) return;
+    clear(box);
+    box.hidden = false;
+    const all = state.gitlabProjects;
+    const filter = ($('gitlab-projects-filter').value || '').trim().toLowerCase();
+    const rows = all.filter((p) => !filter
+      || p.path.toLowerCase().includes(filter)
+      || (p.name || '').toLowerCase().includes(filter));
+    // Configured entries the token cannot see stay visible (and removable).
+    const known = new Set(all.flatMap((p) => [p.path.toLowerCase(), String(p.id)]));
+    const unknown = gitlabProjectEntries().filter((e) => !known.has(normalizeGitlabEntry(e)));
+
+    if (!all.length) {
+      box.appendChild(el('p', { className: 'spaces-empty', text: 'Der Token-User ist in keinem Projekt mindestens Reporter.' }));
+    } else if (!rows.length && !unknown.length) {
+      box.appendChild(el('p', { className: 'spaces-empty', text: 'Kein Projekt passt zum Filter.' }));
+    }
+    for (const project of rows) box.appendChild(gitlabProjectRow(project, false));
+    for (const entry of unknown) {
+      box.appendChild(gitlabProjectRow({ id: entry, path: entry, name: entry }, true));
+    }
+    updateGitlabProjectsStatus();
+  }
+
+  async function loadGitlabProjects() {
+    const btn = $('gitlab-projects-load-btn');
+    btn.disabled = true;
+    setGitlabProjectsStatus('Lade Projekte aus GitLab …');
+    try {
+      const data = await api('GET', '/api/gitlab/projects');
+      state.gitlabProjects = Array.isArray(data.projects) ? data.projects : [];
+      state.gitlabProjectsTruncated = !!data.truncated;
+      renderGitlabProjectsList();
+    } catch (err) {
+      setGitlabProjectsStatus(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   async function startSettingsJob(mode) {
     const fb = $('settings-feedback');
     const { payload, errors } = collectJobForm({ allowMissingStartPage: true });
@@ -1590,6 +1858,13 @@
       selectedSpaces.clear();
       renderSpacesList();
     });
+    $('gitlab-projects-load-btn').addEventListener('click', loadGitlabProjects);
+    $('gitlab-projects-filter').addEventListener('input', renderGitlabProjectsList);
+    $('gitlab-projects-filter').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') e.preventDefault();  // Filter-Enter darf nicht speichern
+    });
+    // Manual edits of the field must be reflected in the checkbox list.
+    $('setting-gitlab-project-ids').addEventListener('change', renderGitlabProjectsList);
     $('spaces-index-btn').addEventListener('click', () => startSettingsJob('spaces'));
     $('modified-index-btn').addEventListener('click', () => startSettingsJob('modified'));
     for (const src of SOURCES) {
@@ -1653,6 +1928,31 @@
       $(`setting-${src}-token-clear`).hidden = !auth.token_set;
       syncAuthFields(src);
     }
+    // GitLab token & defaults
+    pendingTokenClear.gitlab = false;
+    const glTokenInput = $('setting-gitlab-token');
+    if (glTokenInput) {
+      glTokenInput.value = '';
+      const glTokenSet = s.gitlab?.token_set || s.gitlab?.has_token || !!s.gitlab?.token;
+      glTokenInput.placeholder = glTokenSet ? 'unverändert (Token gesetzt)' : 'PAT eingeben …';
+      const glStatus = $('setting-gitlab-token-status');
+      if (glStatus) {
+        glStatus.hidden = !glTokenSet;
+        glStatus.textContent = 'Token gesetzt';
+      }
+      const glClear = $('setting-gitlab-token-clear');
+      if (glClear) {
+        glClear.hidden = !glTokenSet;
+      }
+    }
+    const prefixesInput = $('setting-gitlab-issue-prefixes');
+    if (prefixesInput && !prefixesInput.value.trim() && (!s.gitlab || !s.gitlab.issue_prefixes || !s.gitlab.issue_prefixes.length)) {
+      prefixesInput.value = 'API, BUG';
+    }
+    const requireKeyInput = $('setting-gitlab-require-issue-key');
+    if (requireKeyInput && (!s.gitlab || s.gitlab.require_issue_key === undefined)) {
+      requireKeyInput.checked = true;
+    }
     syncSslFields();
     const sinceInput = $('setting-modified-since');
     if (sinceInput && !sinceInput.value) sinceInput.value = isoDaysAgo(7);
@@ -1692,6 +1992,16 @@
       if (token) auth.token = token;
       if (pendingTokenClear[src] && !token) auth.clear_token = true;
       patch[src].auth = auth;
+    }
+    if (!patch.gitlab) patch.gitlab = {};
+    const glToken = $('setting-gitlab-token') ? $('setting-gitlab-token').value : '';
+    if (glToken) patch.gitlab.token = glToken;
+    if (pendingTokenClear.gitlab && !glToken) {
+      patch.gitlab.token = '';
+      patch.gitlab.clear_token = true;
+    }
+    if (!patch.gitlab.issue_prefixes || !patch.gitlab.issue_prefixes.length) {
+      patch.gitlab.issue_prefixes = ['API', 'BUG'];
     }
     if (patch.graph && patch.graph.default_hops > patch.graph.max_hops) {
       errors.push('Standard-Hops darf nicht größer als Max. Hops sein');
@@ -1742,7 +2052,8 @@
     try {
       const res = await api('POST', '/api/settings/test');
       clear(box);
-      for (const src of SOURCES) {
+      for (const src of ['confluence', 'jira', 'gitlab']) {
+        if (!res[src]) continue;
         const r = res[src] || { ok: false, message: 'Keine Antwort' };
         box.appendChild(el('div', { className: 'test-result-row' }, [
           el('span', { className: 'test-source-name', text: TYPE_LABEL[src] }),
@@ -1787,6 +2098,15 @@
     window.addEventListener('resize', fitGraphViewport);
   }
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-  else boot();
+  if (typeof globalThis !== 'undefined') {
+    globalThis.AppGraphUtils = { getCanonicalGraphTypes, parseGraphTypes, syncGraphSourceToggles, getActiveGraphTypes };
+  }
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { getCanonicalGraphTypes, parseGraphTypes, syncGraphSourceToggles, getActiveGraphTypes };
+  }
+
+  if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+    else boot();
+  }
 })();

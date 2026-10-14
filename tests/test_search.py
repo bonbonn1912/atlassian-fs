@@ -210,7 +210,7 @@ class TestSearch(unittest.TestCase):
 
         expected_keys = {
             "uid", "type", "title", "url", "project", "snippet",
-            "snippet_parts", "updated_at", "status", "document_type"
+            "snippet_parts", "updated_at", "status", "document_type", "score", "importance_score"
         }
         self.assertEqual(set(item.keys()), expected_keys)
         self.assertEqual(item["uid"], "confluence:101")

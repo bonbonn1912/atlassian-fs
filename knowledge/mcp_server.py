@@ -20,8 +20,8 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_knowledge",
         "description": (
-            "Search indexed Confluence pages and Jira issues using full-text search with "
-            "relevance ranking. Use this tool first when looking for information on a topic, "
+            "Search indexed Confluence pages, Jira issues and GitLab commits using full-text search with "
+            "text relevance and bounded incoming/outgoing link importance. Results include score and importance_score. Use this tool first when looking for information on a topic, "
             "finding tickets, or discovering documentation."
         ),
         "inputSchema": {
@@ -33,7 +33,7 @@ TOOL_DEFINITIONS = [
                 },
                 "type": {
                     "type": "string",
-                    "enum": ["all", "confluence", "jira"],
+                    "enum": ["all", "confluence", "jira", "gitlab"],
                     "description": "Filter results by document type (default 'all')",
                 },
                 "limit": {
@@ -50,7 +50,7 @@ TOOL_DEFINITIONS = [
     {
         "name": "get_document",
         "description": (
-            "Retrieve the full details and content of a specific Confluence page or Jira issue "
+            "Retrieve the full details and content of a specific Confluence page, Jira issue or GitLab commit "
             "by its unique identifier (UID). Use this after finding a document via search to "
             "inspect its text and outgoing/incoming links."
         ),
@@ -180,6 +180,16 @@ TOOL_DEFINITIONS = [
 # All tools only read the local SQLite index. Declaring this lets MCP gateways cache their results safely.
 READ_ONLY_ANNOTATIONS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 for _tool in TOOL_DEFINITIONS:
+    if _tool["name"] != "get_index_stats":
+        _tool["inputSchema"]["properties"]["include_gitlab"] = {
+            "type": "boolean", "default": True,
+            "description": "Include GitLab commits and their links (default true). False excludes GitLab nodes and traversal through them.",
+        }
+    if _tool["name"] == "get_graph_subgraph":
+        _tool["inputSchema"]["properties"]["types"] = {
+            "type": "string", "enum": ["all", "confluence", "jira", "gitlab", "jira,gitlab", "confluence,gitlab", "confluence,jira"],
+            "description": "Source types; jira,gitlab gives an issue/commit graph without Confluence.",
+        }
     _tool.setdefault("annotations", dict(READ_ONLY_ANNOTATIONS))
 
 TOOL_MAP = {t["name"]: t for t in TOOL_DEFINITIONS}
@@ -258,19 +268,23 @@ class McpServer:
             if req not in args:
                 return self._tool_error(f"Erforderlicher Parameter {req!r} fehlt.")
 
+        include_gitlab = args.get("include_gitlab", True)
+        if type(include_gitlab) is not bool:
+            return self._tool_error("Parameter 'include_gitlab' muss ein Boolean sein.")
+
         # Tool specific handling
         if name == "search_knowledge":
             query = args.get("query")
             if not isinstance(query, str):
                 return self._tool_error("Parameter 'query' muss ein String sein.")
             stype = args.get("type", "all")
-            if stype not in ("all", "confluence", "jira"):
-                return self._tool_error("Parameter 'type' muss 'all', 'confluence' oder 'jira' sein.")
+            if stype not in ("all", "confluence", "jira", "gitlab"):
+                return self._tool_error("Parameter 'type' muss 'all', 'confluence', 'jira' oder 'gitlab' sein.")
             limit = args.get("limit", 10)
             if not isinstance(limit, int) or limit < 1 or limit > 10:
                 return self._tool_error("Parameter 'limit' muss eine ganze Zahl zwischen 1 und 10 sein.")
 
-            res = search.search(conn, query, type=stype, limit=limit)
+            res = search.search(conn, query, type=stype, limit=limit, include_gitlab=include_gitlab)
             # snippet_parts only exist for HTML highlighting; keep MCP answers compact.
             for item in res["results"]:
                 item.pop("snippet_parts", None)
@@ -293,7 +307,7 @@ class McpServer:
                                         f"{MCP_OUTPUT_MIN_CHARS} und {MCP_OUTPUT_MAX_CHARS} sein.")
             max_chars = min(requested, maximum_chars)
 
-            doc = graph.get_document_detail(conn, uid, max_chars=max_chars)
+            doc = graph.get_document_detail(conn, uid, max_chars=max_chars, include_gitlab=include_gitlab)
             if doc is None:
                 return self._tool_error(f"Dokument mit UID {uid!r} nicht gefunden.")
             doc["max_chars"] = max_chars
@@ -310,7 +324,7 @@ class McpServer:
             if not isinstance(limit, int) or limit < 1 or limit > 200:
                 return self._tool_error("Parameter 'limit' muss zwischen 1 und 200 liegen.")
 
-            neighbors = graph.get_neighbors(conn, uid, direction=direction, limit=limit)
+            neighbors = graph.get_neighbors(conn, uid, direction=direction, limit=limit, include_gitlab=include_gitlab)
             if neighbors is None:
                 return self._tool_error(f"Dokument mit UID {uid!r} nicht gefunden.")
             return self._tool_success(neighbors)
@@ -326,7 +340,11 @@ class McpServer:
             if not isinstance(max_nodes, int) or max_nodes < 1 or max_nodes > 150:
                 return self._tool_error("Parameter 'max_nodes' muss zwischen 1 und 150 liegen.")
 
-            subg = graph.get_subgraph(conn, center=uid, hops=hops, max_nodes=max_nodes)
+            types = args.get("types", "all")
+            if types not in TOOL_MAP[name]["inputSchema"]["properties"]["types"]["enum"]:
+                return self._tool_error("Ungültiger Parameter 'types'.")
+            subg = graph.get_subgraph(conn, center=uid, hops=hops, max_nodes=max_nodes,
+                                      types=types, include_gitlab=include_gitlab)
             if subg is None:
                 return self._tool_error(f"Dokument mit UID {uid!r} nicht gefunden.")
             return self._tool_success(subg)
@@ -339,7 +357,7 @@ class McpServer:
             if not isinstance(limit, int) or limit < 1 or limit > 50:
                 return self._tool_error("Parameter 'limit' muss zwischen 1 und 50 liegen.")
 
-            related = graph.find_related(conn, uid, limit=limit)
+            related = graph.find_related(conn, uid, limit=limit, include_gitlab=include_gitlab)
             if related is None:
                 return self._tool_error(f"Dokument mit UID {uid!r} nicht gefunden.")
             return self._tool_success(related)
@@ -413,7 +431,7 @@ class McpServer:
                         "version": "1.0.0",
                     },
                     "instructions": (
-                        "Local Confluence and Jira Knowledge Graph server. Provides full-text "
+                        "Local Confluence, Jira and GitLab Knowledge Graph server. Provides full-text "
                         "search, document inspection, relationship discovery, and subgraph navigation."
                     ),
                 },

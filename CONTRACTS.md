@@ -432,7 +432,7 @@ Routen (alle JSON, Fehler als `{"error": {"code": "...", "message": "..."}}`):
 | GET | `/api/config` | `{"defaults": cfg.crawl_defaults + confluence_sleep_seconds + jira_sleep_seconds, "limits": JOB_FIELD_SPECS als {name:{type,min,max}}, "search": cfg.search, "graph": cfg.graph, "configured": {"confluence": bool, "jira": bool}}` |
 | GET | `/api/settings` | `ConfigStore.get_public()` |
 | PUT | `/api/settings` | Patch → 200 neue public config; 400 bei ConfigError; 409 wenn Job läuft und Verbindungsdaten geändert werden sollen |
-| POST | `/api/settings/test` | `{"confluence": {...}, "jira": {...}}` via `test_connection()` mit aktueller Config (eigenes Budget 5 Requests, eigenes stop_event) |
+| POST | `/api/settings/test` | `{"confluence": {...}, "jira": {...}}` via `test_connection()` mit aktueller Config (eigenes Budget 5 Requests, GitLab 55, eigenes stop_event) |
 | GET | `/api/spaces?refresh=1` | `{"spaces": [{key,name,type,id,url}], "fetched_at", "cached"}` – alle sichtbaren Confluence-Spaces (Budget 400 Requests/300 s, 10 min In-Memory-Cache; `refresh=1` erzwingt neu laden, ein Fetch wird serialisiert (Single-Flight), Cache wird bei Änderungen an `confluence`/`http` verworfen). 400 ohne Basis-URL, 502 bei Upstream-Fehler, bei Fehler + Cache stattdessen stale Cache mit `"stale": true` und `"warning"` |
 | POST | `/api/jobs` | 202 `{"job_id","state"}`; 400 / 409 |
 | GET | `/api/jobs/current` | Status oder `{"job": null}`? → **immer** `{"job": status|null}` |
@@ -466,3 +466,56 @@ HTTP (Zertifikatsprüfung-Checkbox mit Hinweis „aus = für interne Zertifikate
 System-Proxy, max. Antwortgröße, User-Agent), Crawl-Standardwerte, Index-, Such-, Graph-Parameter,
 Server (Host/Port mit Hinweis „Neustart nötig“), Buttons „Speichern“ und „Verbindung testen“.
 Details siehe Agent-Auftrag.
+
+## GitLab-Commits (`knowledge/gitlab.py`, Agent „gitlab“)
+
+Self-managed GitLab und GitLab.com, beide über REST API v4 (`<base_url>/api/v4`), Token =
+Personal Access Token (Scope `read_api`), gesendet als Header `PRIVATE-TOKEN` (nie in der URL).
+Für `gitlab.com` wird TLS immer geprüft; sonst gilt `http.verify_ssl`.
+
+```
+cfg["gitlab"] = {base_url, token, issue_prefixes: ["API","BUG"], project_ids: [],
+                 ref_name: "", all_branches: false, since: "", sleep_seconds: 0.5,
+                 incremental: true, require_issue_key: true}
+```
+- `project_ids`: numerische ID, Pfad `gruppe/sub/projekt` oder Projekt-URL derselben Instanz
+  (`https://gitlab.com/dw191299/bonbot[.git][/-/tree/main]`) → wird beim Speichern zum Pfad
+  normalisiert; URLs anderer Hosts/Schemes/Context-Paths → 400. Max. 200 Projekte.
+- `issue_prefixes`: Jira-Projektschlüssel (`^[A-Z][A-Z0-9_]*$`, Großschreibung, Dedupe, „API-“ → „API“).
+  Leer → Fallback `jira.project_keys`; beides leer → keine Jira-Kanten.
+  Treffer case-sensitiv mit Wortgrenzen: `API-2323`, `[BUG-7]`, `feature/API-12-x`; nicht `api-1`, `XAPI-1`.
+- `require_issue_key=true` (Default): nur Commits mit Treffer werden indexiert; `false` = alle Commits.
+- Token: `GET /api/settings` → `gitlab.token = ""`, `gitlab.token_set: bool`. `PUT` mit
+  `{"gitlab": {"token": "..."}}` setzt, leerer Token behält, `{"gitlab": {"clear_token": true}}` löscht.
+  Env-Override `GITLAB_TOKEN`. `PUT` mit `gitlab` während laufendem Job → 409.
+
+Modelle/DB: `source_type="gitlab"`, `document_type="commit"`, UID `gitlab:<numerische Projekt-ID>:<sha40>`
+(`models.gitlab_commit_uid`, `split_gitlab_uid`), `space_or_project` = Projektpfad, `title` =
+`"<short_id>: <Betreff>"`, `labels` = gefundene Jira-Keys, `source_created_at`/`source_updated_at`
+= authored/committed date. Kanten Commit → `jira:<KEY>`, kind `mentions_jira`, relation_label
+`"mentions"`, source_field `"commit_message"`, anchor_text = Key, evidence_url = Commit-URL.
+Nicht indexierte Tickets bleiben Referenzknoten (`state="discovered"`, URL `<jira.base_url>/browse/KEY`
+falls Jira konfiguriert). Migration 4 baut `documents` neu (CHECK erweitert, IDs bleiben),
+ergänzt `crawl_jobs.gitlab_indexed` und Tabelle `gitlab_sync_state(project_id, ref, synced_until,
+last_sha, scan_signature, updated_at)`. `db.delete_document`, `db.get_existing_document_uids(conn, source_types)`.
+
+Job-Modus: `POST /api/jobs {"gitlab_only": true, "gitlab_since": "", "max_gitlab_commits": 1000,
+"gitlab_sleep_seconds": 0.5, "refresh_existing": false}` (auch in `crawl_defaults`; ohne
+Confluence-Konfiguration startbar; `start_page_uid = "gitlab-sync"`; mit `refresh_only` → 400).
+Status enthält `gitlab_indexed` (`skipped` = Commits ohne Jira-Bezug). Commit-Budget =
+`min(max_gitlab_commits, max_total_documents)`, dazu `max_api_requests`/`max_duration_minutes`.
+Inkrementell: Checkpoint pro Projekt/Ref nur nach vollständigem, fehlerfreiem Listing; genutzt nur bei
+gleicher Scan-Signatur (Präfixe, require_issue_key, Ref) → geänderte Präfixe = Vollscan (Backfill,
+nicht mehr passende Commits werden entfernt). Überlappung 2 Tage. `refresh_existing=true` = Vollscan.
+Atlassian-Jobs (`refresh_only`, BFS) überspringen GitLab-UIDs. CLI: `python app.py gitlab-sync [--full] [--since 7d] [--max-commits N]`.
+
+API: `/api/config` → `configured.gitlab` (Basis-URL + Projekte gültig), `defaults.gitlab_sleep_seconds`,
+`limits` inkl. `gitlab_only`, `max_gitlab_commits`, `gitlab_since`, `gitlab_sleep_seconds`.
+`POST /api/settings/test` → zusätzlich `gitlab: {ok, message, version, projects:[{ref,id,path}], unchecked_projects?}`
+(prüft bis zu 50 eingetragene Projekte; ohne Token wird `/version` übersprungen, nur öffentliche Projekte).
+`GET /api/gitlab/projects` → `{projects:[{id,path,name,web_url,visibility,last_activity_at}], truncated, configured}` –
+Projekte mit Mitgliedschaft und Rolle ≥ Reporter (`membership=true&min_access_level=20`, max. 20 Seiten à 100,
+Budget 25 Requests) mit gespeicherter Config; 400 ohne Basis-URL oder Token, 502 bei Upstream-Fehler (Token redigiert).
+`GET /api/search?...&type=gitlab&include_gitlab=true|false` (Default true),
+`GET /api/graph?...&types=<all|confluence|jira|gitlab|jira,gitlab|confluence,gitlab|confluence,jira>&include_gitlab=…`,
+`/api/top-documents?types=` gleiche Kombinationen; ungültige Werte → 400.

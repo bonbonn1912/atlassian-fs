@@ -22,6 +22,21 @@
       "token": ""
     }
   },
+  "gitlab": {
+    "base_url": "https://gitlab.example.intern",
+    "token": "",
+    "issue_prefixes": [
+      "API",
+      "BUG"
+    ],
+    "project_ids": [],
+    "ref_name": "",
+    "all_branches": false,
+    "since": "",
+    "sleep_seconds": 0.5,
+    "incremental": true,
+    "require_issue_key": true
+  },
   "http": {
     "verify_ssl": false,
     "ca_bundle": "",
@@ -49,7 +64,10 @@
     "resolve_page_titles": true,
     "refresh_existing": false,
     "request_timeout_seconds": 20,
-    "max_retries": 4
+    "max_retries": 4,
+    "gitlab_only": false,
+    "max_gitlab_commits": 1000,
+    "gitlab_since": ""
   },
   "index": {
     "chunk_target_chars": 1200,

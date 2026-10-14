@@ -7,7 +7,7 @@ crawling according to CONTRACTS.md and implementation.md (§5, §9, §10, §11, 
 from __future__ import annotations
 
 import collections
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import threading
@@ -15,7 +15,7 @@ import time
 from typing import Any, Callable
 
 from . import db
-from .config import ConfigStore, validate_job_params
+from .config import GITLAB_START_UID, ConfigStore, validate_job_params
 from .models import (
     AtlassianError,
     BudgetExceeded,
@@ -54,6 +54,11 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+ATLASSIAN_SOURCE_TYPES = ("confluence", "jira")
+# Incremental GitLab syncs re-list this many days before the last checkpoint:
+# `since` filters by committed date, which can lag behind the push time.
+GITLAB_INCREMENTAL_OVERLAP_DAYS = 2
 
 
 class JobConflict(KnowledgeError):
@@ -170,6 +175,42 @@ def _default_client_factory(
     return confluence_client, jira_client
 
 
+def _default_gitlab_client_factory(
+    cfg: dict,
+    params: dict,
+    stop_event: threading.Event,
+    budget: RequestBudget,
+    on_event: Callable[[dict], None],
+) -> Any:
+    from . import gitlab
+
+    http = gitlab.build_gitlab_http(
+        cfg,
+        stop_event=stop_event,
+        budget=budget,
+        sleep_seconds=float(params.get("gitlab_sleep_seconds",
+                                       (cfg.get("gitlab") or {}).get("sleep_seconds", 0.5))),
+        timeout=float(params.get("request_timeout_seconds", 20.0)),
+        max_retries=int(params.get("max_retries", 4)),
+        on_event=on_event,
+    )
+    return gitlab.GitLabClient(http, cfg, index_cfg=cfg.get("index") or {})
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class JobManager:
     """Manages crawl job lifecycles and background worker execution."""
 
@@ -184,10 +225,16 @@ class JobManager:
             ]
             | None
         ) = None,
+        gitlab_client_factory: (
+            Callable[[dict, dict, threading.Event, RequestBudget, Callable[[dict], None]], Any]
+            | None
+        ) = None,
     ) -> None:
         self.config_store = config_store
         self.db_path = Path(db_path)
         self.client_factory = client_factory
+        # gitlab_client_factory(cfg, params, stop_event, budget, on_event) -> GitLabClient
+        self.gitlab_client_factory = gitlab_client_factory
 
         self._lock = threading.RLock()
         self._live_lock = threading.RLock()
@@ -203,6 +250,7 @@ class JobManager:
             "queue_size": 0,
             "pages_indexed": 0,
             "jira_indexed": 0,
+            "gitlab_indexed": 0,
             "api_requests": 0,
             "skipped": 0,
             "errors": 0,
@@ -244,7 +292,7 @@ class JobManager:
                         "Ein Crawl-Job läuft bereits oder wird gerade gestoppt."
                     )
                 if params.get("refresh_only"):
-                    existing_uids = db.get_existing_document_uids(conn)
+                    existing_uids = db.get_existing_document_uids(conn, ATLASSIAN_SOURCE_TYPES)
                     if not existing_uids:
                         raise ConfigError(
                             "Keine bestehenden Dokumente in der Datenbank vorhanden, die aktualisiert werden können."
@@ -255,7 +303,9 @@ class JobManager:
             finally:
                 conn.close()
 
-            if params.get("refresh_only"):
+            if params.get("gitlab_only"):
+                start_page_uid = GITLAB_START_UID
+            elif params.get("refresh_only"):
                 start_page_uid = "refresh:existing"
             elif params.get("modified_since"):
                 start_page_uid = f"recent:{params['modified_since']}"
@@ -300,11 +350,14 @@ class JobManager:
                     "queue_size": existing_count,
                     "pages_indexed": 0,
                     "jira_indexed": 0,
+                    "gitlab_indexed": 0,
                     "api_requests": 0,
                     "skipped": 0,
                     "errors": 0,
                     "reused_documents": 0,
-                    "last_message": "Gestartet (Aktualisierung bestehender Dokumente)"
+                    "last_message": "Gestartet (GitLab-Commits)"
+                    if params.get("gitlab_only")
+                    else "Gestartet (Aktualisierung bestehender Dokumente)"
                     if params.get("refresh_only")
                     else (
                         "Gestartet (Aktualisierung geänderter Seiten)"
@@ -383,6 +436,7 @@ class JobManager:
                         "queue_size",
                         "pages_indexed",
                         "jira_indexed",
+                        "gitlab_indexed",
                         "api_requests",
                         "skipped",
                         "errors",
@@ -451,6 +505,9 @@ class JobManager:
             max_duration_minutes = float(params.get("max_duration_minutes", 60))
             max_duration_seconds = max_duration_minutes * 60.0
             budget = RequestBudget(max_requests=max_requests, max_duration_seconds=max_duration_seconds)
+            if params.get("gitlab_only"):
+                self._run_gitlab_job(conn, job_id, params, cfg, stop_event, budget)
+                return
 
             def on_client_event(ev: dict) -> None:
                 ev_type = ev.get("type")
@@ -805,7 +862,7 @@ class JobManager:
                     )
 
             elif params.get("refresh_only"):
-                existing_uids = db.get_existing_document_uids(conn)
+                existing_uids = db.get_existing_document_uids(conn, ATLASSIAN_SOURCE_TYPES)
                 queue: collections.deque[tuple[str, int, int]] = collections.deque(
                     [(uid, 0, 0) for uid in existing_uids]
                 )
@@ -878,6 +935,8 @@ class JobManager:
                     try:
                         cand_type, cand_id = parse_uid(cand_uid)
                     except ValueError:
+                        continue
+                    if cand_type not in ATLASSIAN_SOURCE_TYPES:
                         continue
                     if cand_type == "confluence":
                         if bulk_confluence is None or len(conf_ids) >= min(batch_size, remaining_conf):
@@ -1069,6 +1128,10 @@ class JobManager:
 
                     seen.add(uid)
                     src_type, src_id = parse_uid(uid)
+                    if src_type not in ATLASSIAN_SOURCE_TYPES:
+                        # GitLab commits are indexed by gitlab_only jobs only.
+                        db.queue_set_state(conn, job_id, uid, "skipped")
+                        continue
 
                     # Type budget enforcement
                     if (
@@ -1478,3 +1541,239 @@ class JobManager:
                 )
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------ GitLab
+
+    def _run_gitlab_job(
+        self,
+        conn: Any,
+        job_id: int,
+        params: dict,
+        cfg: dict,
+        stop_event: threading.Event,
+        budget: RequestBudget,
+    ) -> None:
+        """Index commits of all configured GitLab projects (independent of Confluence).
+
+        Per project/ref a checkpoint (`gitlab_sync_state`) records up to when the
+        listing was complete. It is only used if the scan signature (issue
+        prefixes, key filter, ref scope) is unchanged, so changing the prefixes
+        backfills older commits. `refresh_existing` forces a full scan.
+        """
+        from . import gitlab, text
+
+        gl_cfg = cfg.get("gitlab") or {}
+        # GitLab has its own budget, additionally capped by the overall document budget.
+        max_commits = min(int(params.get("max_gitlab_commits", 1000)),
+                          int(params.get("max_total_documents", 200_000)))
+        counters = {"indexed": 0, "skipped": 0, "errors": 0, "reused": 0, "removed": 0}
+        index_cfg = cfg.get("index") or {}
+        jira_base = ((cfg.get("jira") or {}).get("base_url") or "").strip().rstrip("/")
+
+        def on_event(ev: dict) -> None:
+            # RateLimitedClient emits {"phase": "rate_limit_wait"|"request", ...};
+            # the legacy "type" spelling is accepted as well.
+            kind = ev.get("phase") or {
+                "wait_sleep": "rate_limit_wait", "wait_retry": "rate_limit_wait",
+                "request_start": "request"}.get(ev.get("type") or "")
+            with self._live_lock:
+                if kind == "rate_limit_wait":
+                    self._live["phase"] = "rate_limit_wait"
+                    self._live["retry_wait_seconds"] = ev.get("seconds", ev.get("wait_seconds"))
+                    self._live["wait_source"] = ev.get("source")
+                elif kind == "request":
+                    self._live["phase"] = "request"
+                    self._live["retry_wait_seconds"] = None
+                    self._live["wait_source"] = None
+
+        def progress(message: str, current: str | None = None) -> None:
+            with self._live_lock:
+                self._live["gitlab_indexed"] = counters["indexed"]
+                self._live["api_requests"] = budget.used
+                self._live["skipped"] = counters["skipped"]
+                self._live["errors"] = counters["errors"]
+                self._live["reused_documents"] = counters["reused"]
+                self._live["current_uid"] = current
+                self._live["last_message"] = message
+            db.update_job(conn, job_id, gitlab_indexed=counters["indexed"],
+                          api_requests=budget.used, skipped=counters["skipped"],
+                          errors=counters["errors"], current_uid=current, last_message=message)
+
+        def finish(state: str, message: str) -> None:
+            with self._live_lock:
+                self._live["phase"] = "idle"
+                self._live["retry_wait_seconds"] = None
+                self._live["wait_source"] = None
+                self._live["queue_size"] = 0
+                self._live["gitlab_indexed"] = counters["indexed"]
+                self._live["api_requests"] = budget.used
+                self._live["last_message"] = message
+            db.update_job(conn, job_id, state=state, finished_at=db.now_iso(),
+                          gitlab_indexed=counters["indexed"], api_requests=budget.used,
+                          skipped=counters["skipped"], errors=counters["errors"],
+                          last_message=message)
+            db.add_job_log(conn, job_id, "error" if state == JOB_FAILED else "info",
+                           f"Job beendet mit Status '{state}': {message}")
+
+        factory = self.gitlab_client_factory or _default_gitlab_client_factory
+        try:
+            client = factory(cfg, params, stop_event, budget, on_event)
+            project_refs = client.project_refs()
+        except Exception as exc:
+            logger.warning("GitLab-Client für Job %d nicht erstellbar: %s", job_id, exc)
+            finish(JOB_FAILED, f"Client-Fehler: {exc}")
+            return
+
+        signature = gitlab.scan_signature(cfg)
+        ref = gitlab.ref_key(cfg)
+        if not client.prefixes:
+            db.add_job_log(conn, job_id, "warning",
+                           "Keine Jira-Präfixe konfiguriert (gitlab.issue_prefixes) – "
+                           "Commits werden ohne Jira-Verknüpfung indexiert")
+        explicit_since = _parse_iso(params.get("gitlab_since") or "")
+        if explicit_since is None and gl_cfg.get("since"):
+            from .config import _normalize_modified_since
+
+            normalized, _err = _normalize_modified_since(gl_cfg.get("since"), "gitlab.since")
+            explicit_since = _parse_iso(normalized)
+
+        with self._live_lock:
+            self._live["queue_size"] = len(project_refs)
+        failures: list[str] = []
+        truncated: str | None = None
+        processed_projects = 0
+
+        try:
+            for position, project_ref in enumerate(project_refs):
+                if stop_event.is_set():
+                    raise CrawlStopped()
+                with self._live_lock:
+                    self._live["queue_size"] = len(project_refs) - position
+                progress(f"GitLab-Projekt {project_ref} wird gelesen …")
+                try:
+                    project = client.get_project(project_ref)
+                except (CrawlStopped, BudgetExceeded):
+                    raise
+                except Exception as exc:   # one unreadable project must not stop the job
+                    failures.append(f"{project_ref}: {exc}")
+                    counters["errors"] += 1
+                    db.add_job_log(conn, job_id, "warning",
+                                   f"GitLab-Projekt {project_ref!r} nicht lesbar: {exc}")
+                    continue
+
+                project_id = project["id"]
+                path = project["path_with_namespace"]
+                since_dt = explicit_since
+                mode = "vollständig"
+                state = db.get_gitlab_sync_state(conn, project_id, ref)
+                if (gl_cfg.get("incremental", True) and not params.get("refresh_existing")
+                        and state and state.get("scan_signature") == signature):
+                    checkpoint = _parse_iso(state.get("synced_until"))
+                    if checkpoint is not None:
+                        checkpoint -= timedelta(days=GITLAB_INCREMENTAL_OVERLAP_DAYS)
+                        if since_dt is None or checkpoint > since_dt:
+                            since_dt = checkpoint
+                        mode = "inkrementell"
+                elif state and state.get("scan_signature") != signature:
+                    db.add_job_log(conn, job_id, "info",
+                                   f"{path}: Präfixe/Filter geändert – vollständiger Scan")
+
+                listing_started = datetime.now(timezone.utc)
+                since = _iso_utc(since_dt) if since_dt else ""
+                db.add_job_log(conn, job_id, "info",
+                               f"{path}: Commit-Scan {mode}" + (f" seit {since}" if since else ""))
+                complete = True
+                commit_errors = 0
+                newest_sha: str | None = None
+                matched = 0
+
+                budget_hit = False
+                pages = client.iter_commit_pages(project_id, since=since)
+                for page in pages:
+                    for commit in page:
+                        if counters["indexed"] >= max_commits:
+                            complete = False
+                            budget_hit = True
+                            break
+                        if stop_event.is_set():
+                            raise CrawlStopped()
+                        try:
+                            doc = client.commit_to_document(project, commit)
+                        except Exception as exc:
+                            # No checkpoint: the next run must see this commit again.
+                            complete = False
+                            commit_errors += 1
+                            counters["errors"] += 1
+                            db.add_job_log(conn, job_id, "warning",
+                                           f"{path}: Commit nicht lesbar: {exc}")
+                            continue
+                        newest_sha = newest_sha or doc.source_version
+                        if client.require_issue_key and not doc.links:
+                            counters["skipped"] += 1
+                            # Commit was indexed with an earlier prefix set.
+                            if db.get_document(conn, doc.uid) is not None:
+                                db.delete_document(conn, doc.uid)
+                                counters["removed"] += 1
+                            continue
+                        if doc.links:
+                            matched += 1
+                        existing = db.get_document(conn, doc.uid)
+                        chunks = text.chunk_sections(
+                            doc.title, doc.sections,
+                            target_chars=int(index_cfg.get("chunk_target_chars", 1200)),
+                            overlap_chars=int(index_cfg.get("chunk_overlap_chars", 150)),
+                            min_chars=int(index_cfg.get("min_chunk_chars", 80)))
+                        with self._live_lock:
+                            self._live["phase"] = "saving"
+                        result = db.save_document(conn, doc, chunks)
+                        if jira_base and doc.links:
+                            with db.transaction(conn):
+                                for link in doc.links:
+                                    conn.execute(
+                                        "UPDATE documents SET url=? WHERE uid=? AND url=''",
+                                        (f"{jira_base}/browse/{link.anchor_text}", link.uid))
+                        if existing and existing.get("state") == STATE_INDEXED and not result["content_changed"]:
+                            counters["reused"] += 1
+                        counters["indexed"] += 1
+                    else:
+                        progress(f"{path}: {counters['indexed']} Commit(s) indexiert",
+                                 current=f"gitlab:{project_id}")
+                        continue
+                    pages.close()   # commit budget reached: stop listing
+                    break
+
+                processed_projects += 1
+                db.add_job_log(conn, job_id, "info",
+                               f"{path}: {matched} Commit(s) mit Jira-Bezug"
+                               + (" (unvollständig, Commit-Budget erreicht)" if budget_hit else "")
+                               + (f" ({commit_errors} fehlerhafte Commit(s), kein Checkpoint)"
+                                  if commit_errors else ""))
+                if complete:
+                    db.save_gitlab_sync_state(conn, project_id, ref, _iso_utc(listing_started),
+                                              newest_sha, signature)
+                if budget_hit:
+                    truncated = f"Commit-Budget erreicht ({max_commits})"
+                    break
+        except CrawlStopped:
+            finish(JOB_STOPPED, "Gestoppt")
+            return
+        except BudgetExceeded as exc:
+            finish(JOB_COMPLETED, f"Budget erschöpft: {exc}")
+            return
+        except Exception as exc:
+            logger.exception("GitLab-Job %d fehlgeschlagen", job_id)
+            finish(JOB_FAILED, f"GitLab-Fehler: {exc}")
+            return
+
+        if processed_projects == 0 and failures:
+            finish(JOB_FAILED, "Kein GitLab-Projekt lesbar: " + "; ".join(failures))
+            return
+        summary = (f"GitLab-Indexierung abgeschlossen: {counters['indexed']} Commit(s) indexiert, "
+                   f"{counters['skipped']} ohne Jira-Bezug übersprungen")
+        if counters["removed"]:
+            summary += f", {counters['removed']} entfernt"
+        if truncated:
+            summary = f"{truncated} – {summary}"
+        if failures:
+            summary += f"; nicht lesbar: {len(failures)} Projekt(e)"
+        finish(JOB_COMPLETED, summary)

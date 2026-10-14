@@ -25,17 +25,17 @@ class TestDatabaseMigrationsAndDates(unittest.TestCase):
 
         # Apply migrations
         latest_ver = db.init_db(conn)
-        self.assertEqual(latest_ver, 3)
+        self.assertEqual(latest_ver, 4)
 
         # Verify source_created_at exists and migration recorded
         cols_after = {r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
         self.assertIn("source_created_at", cols_after)
         versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()]
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
 
         # Verify idempotency
         re_init_ver = db.init_db(conn)
-        self.assertEqual(re_init_ver, 3)
+        self.assertEqual(re_init_ver, 4)
         conn.close()
 
     def test_migration_duplicate_column_tolerance(self) -> None:
@@ -53,9 +53,9 @@ class TestDatabaseMigrationsAndDates(unittest.TestCase):
 
         # init_db must handle 'duplicate column name' gracefully
         latest_ver = db.init_db(conn)
-        self.assertEqual(latest_ver, 3)
+        self.assertEqual(latest_ver, 4)
         versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()]
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
         conn.close()
 
     def test_missing_dates_are_not_manufactured(self) -> None:

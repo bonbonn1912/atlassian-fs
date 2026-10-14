@@ -22,11 +22,15 @@
   --border-focus: #0052cc;
   --ring-focus: rgba(0, 82, 204, 0.25);
 
-  /* Atlassian-Branding */
+  /* Atlassian & GitLab Branding */
   --confluence-blue: #1868db;
   --confluence-bg: #ebf3fc;
   --jira-orange: #e2740d;
   --jira-bg: #fff4e5;
+  --gitlab-orange: #fc6d26;
+  --gitlab-color: #fc6d26;
+  --gitlab-bg: #fff1ea;
+  --gitlab-jira-green: #1f9d55;
 
   /* Statusfarben */
   --status-success: #00875a;
@@ -75,6 +79,10 @@
     --confluence-bg: rgba(76, 154, 255, 0.15);
     --jira-orange: #ff991f;
     --jira-bg: rgba(255, 153, 31, 0.15);
+    --gitlab-orange: #fc6d26;
+    --gitlab-color: #ff8447;
+    --gitlab-bg: rgba(252, 109, 38, 0.2);
+    --gitlab-jira-green: #3ecf7a;
 
     --status-success: #36b37e;
     --status-success-bg: rgba(54, 179, 126, 0.15);
@@ -858,6 +866,12 @@ a:hover {
   border: 1px solid var(--jira-orange);
 }
 
+.badge-gitlab {
+  background-color: var(--gitlab-bg);
+  color: var(--gitlab-color);
+  border: 1px solid var(--gitlab-color);
+}
+
 .result-url-line {
   font-size: 12px;
   color: var(--text-muted);
@@ -916,6 +930,16 @@ a:hover {
 .meta-chip-status {
   font-weight: 600;
   color: var(--text-main);
+}
+
+.meta-chip-score {
+  color: var(--confluence-blue);
+  font-weight: 600;
+}
+
+.meta-chip-importance {
+  color: var(--jira-orange);
+  font-weight: 600;
 }
 
 .result-graph-link {
@@ -1329,6 +1353,21 @@ a:hover {
   gap: 6px;
 }
 
+.graph-source-toggles {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.graph-source-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  user-select: none;
+}
+
 .toolbar-label {
   font-size: 12px;
   font-weight: 600;
@@ -1461,6 +1500,13 @@ a:hover {
   border: 1.5px solid var(--jira-orange);
 }
 
+.legend-swatch.node-gitlab {
+  border-radius: 2px;
+  transform: rotate(45deg);
+  background-color: var(--gitlab-bg);
+  border: 1.5px solid var(--gitlab-orange);
+}
+
 .legend-swatch.node-reference {
   border-radius: 50%;
   background-color: var(--bg-subtle);
@@ -1496,6 +1542,16 @@ a:hover {
 
 .legend-line.edge-jira {
   background-color: var(--jira-orange);
+}
+
+.legend-line.edge-mentions-jira {
+  background-color: var(--jira-orange);
+  border-top: 1px dashed var(--jira-orange);
+}
+
+.legend-line.edge-gitlab-jira {
+  height: 3px;
+  background-color: var(--gitlab-jira-green);
 }
 
 /* Loading overlay */
@@ -2351,6 +2407,15 @@ a:hover {
   background-color: var(--confluence-bg);
   color: var(--confluence-blue);
   white-space: nowrap;
+}
+
+.space-key.gitlab-project-id {
+  background-color: var(--gitlab-bg);
+  color: var(--gitlab-color);
+}
+
+.gitlab-projects-picker .spaces-list {
+  margin-bottom: 6px;
 }
 
 .space-type {

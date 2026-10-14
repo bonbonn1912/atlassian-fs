@@ -26,11 +26,23 @@
     jira_relates_to: { color: 'jira', width: 1.2, dash: [1.5, 3] },
     jira_parent_of: { color: 'jira', width: 2.2, dash: [] },
     links_to_confluence: { color: 'confluence', width: 1.2, dash: [6, 2, 2, 2] },
+    // Virtual style: mentions_jira from a GitLab commit (commit -> Jira ticket).
+    gitlab_jira: { color: 'gitlabJira', width: 2, dash: [] },
   };
 
+  /** Style key of an edge; GitLab -> Jira mentions are highlighted separately. */
+  function edgeStyleKey(kind, source) {
+    return kind === 'mentions_jira' && source && source.type === 'gitlab' ? 'gitlab_jira' : kind;
+  }
+
   function cssVar(name, fallback) {
-    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-    return v || fallback;
+    if (typeof document === 'undefined' || typeof getComputedStyle === 'undefined') return fallback;
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return v || fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   function truncate(text, max) {
@@ -162,16 +174,18 @@
       this._readColors();
       this._bindEvents();
       this._resize();
-      if (window.ResizeObserver) {
-        new ResizeObserver(() => this._resize()).observe(this.container);
-      } else {
-        window.addEventListener('resize', () => this._resize());
-      }
-      if (window.matchMedia) {
-        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-          this._readColors();
-          this.requestDraw();
-        });
+      if (typeof window !== 'undefined') {
+        if (window.ResizeObserver) {
+          new ResizeObserver(() => this._resize()).observe(this.container);
+        } else {
+          window.addEventListener('resize', () => this._resize());
+        }
+        if (window.matchMedia) {
+          window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+            this._readColors();
+            this.requestDraw();
+          });
+        }
       }
     }
 
@@ -183,6 +197,8 @@
       this.colors = {
         confluence: cssVar('--confluence-blue', '#1868db'),
         jira: cssVar('--jira-orange', '#e2740d'),
+        gitlab: cssVar('--gitlab-orange', '#fc6d26'),
+        gitlabJira: cssVar('--gitlab-jira-green', '#1f9d55'),
         danger: cssVar('--status-danger', '#de350b'),
         muted: cssVar('--text-muted', '#7a869a'),
         main: cssVar('--text-main', '#172b4d'),
@@ -248,7 +264,8 @@
       for (const e of data.edges || []) {
         const source = nodeMap.get(e.source), target = nodeMap.get(e.target);
         if (!source || !target) continue;
-        const edge = { ...e, s: source, t: target, _id: String(e.id ?? `${e.source}->${e.target}:${e.kind}`) };
+        const edge = { ...e, s: source, t: target, _id: String(e.id ?? `${e.source}->${e.target}:${e.kind}`),
+          _style: edgeStyleKey(e.kind, source) };
         edges.push(edge);
         edgeMap.set(edge._id, edge);
         if (edges.length % 1024 === 0 && performance.now() >= deadline) {
@@ -725,7 +742,7 @@
       title.textContent = node.title || node.uid;
       const meta = document.createElement('div');
       meta.className = 'graph-tooltip-meta';
-      const typeLabel = node.type === 'jira' ? 'Jira' : 'Confluence';
+      const typeLabel = node.type === 'gitlab' ? 'GitLab' : (node.type === 'jira' ? 'Jira' : 'Confluence');
       const inDeg = node.in_degree !== undefined ? String(node.in_degree) + " eingehende Links" : null;
       const parts = [node.uid, typeLabel, node.document_type, node.status, inDeg, node.state !== 'indexed' ? node.state : null];
       meta.textContent = parts.filter(Boolean).join(' · ');
@@ -776,7 +793,7 @@
         selectedUid: this.selectedUid, selectedEdgeId: this.selectedEdgeId, highlight: highlight ? [...highlight] : null };
       if (this.renderVersion !== version) {
         request.nodes = this.nodes.map((n) => ({ idx: n.idx, uid: n.uid, x: n.x, y: n.y, r: n.r, type: n.type, state: n.state }));
-        request.edges = this.edges.map((e) => ({ source: e.source, target: e.target, kind: e.kind, _id: e._id, s: e.s.idx, t: e.t.idx }));
+        request.edges = this.edges.map((e) => ({ source: e.source, target: e.target, kind: e.kind, _id: e._id, s: e.s.idx, t: e.t.idx, _style: e._style }));
         this.renderVersion = version;
       }
       this.renderBusy = true;
@@ -917,7 +934,7 @@
         visibleEdges++;
         const active = !hl || (hl.has(e.source) && hl.has(e.target) &&
           (this.selectedEdgeId ? e._id === this.selectedEdgeId : (e.source === this.selectedUid || e.target === this.selectedUid)));
-        const key = `${e.kind}|${active ? 1 : 0}`;
+        const key = `${e._style || e.kind}|${active ? 1 : 0}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(e);
       }
@@ -925,7 +942,9 @@
       // when few edges are visible and they are readable anyway.
       const detailed = k >= 0.5 && visibleEdges <= 2500;
       const drawArrows = detailed;
-      const sortedKeys = [...groups.keys()].sort((a, b) => a.endsWith('|1') - b.endsWith('|1'));
+      // Active edges on top; within each layer GitLab -> Jira edges stay above the rest.
+      const layer = (key) => (key.endsWith('|1') ? 2 : 0) + (key.startsWith('gitlab_jira|') ? 1 : 0);
+      const sortedKeys = [...groups.keys()].sort((a, b) => layer(a) - layer(b));
       for (const key of sortedKeys) {
         const [kind, activeFlag] = key.split('|');
         const style = EDGE_STYLES[kind] || EDGE_STYLES.links_to;
@@ -986,7 +1005,7 @@
       }
       for (const [key, list] of nodeGroups) {
         const [type, status, dimFlag] = key.split('|');
-        const base = type === 'jira' ? colors.jira : colors.confluence;
+        const base = type === 'gitlab' ? colors.gitlab : (type === 'jira' ? colors.jira : colors.confluence);
         beginStyle(dimFlag === '1' ? 0.15 : 1);
         ctx.beginPath();
         // Bounded paths avoid quadratic tessellation work in Canvas implementations.
@@ -1028,7 +1047,7 @@
           if (n.state !== 'indexed' || n.r * k < 8) continue;
           ctx.globalAlpha = hl && !hl.has(n.uid) ? 0.2 : 1;
           ctx.fillStyle = '#ffffff';
-          ctx.fillText(n.type === 'jira' ? 'J' : 'C', n.x * k + tx, n.y * k + ty + 0.5);
+          ctx.fillText(n.type === 'gitlab' ? 'GL' : (n.type === 'jira' ? 'J' : 'C'), n.x * k + tx, n.y * k + ty + 0.5);
         }
         ctx.globalAlpha = 1;
       }
@@ -1058,7 +1077,14 @@
     }
 
     _shapePath(n, type, ctx = this.ctx) {
-      if (type === 'jira') {
+      if (type === 'gitlab') {
+        const r = n.r * 1.1;
+        ctx.moveTo(n.x, n.y - r);
+        ctx.lineTo(n.x + r, n.y);
+        ctx.lineTo(n.x, n.y + r);
+        ctx.lineTo(n.x - r, n.y);
+        ctx.closePath();
+      } else if (type === 'jira') {
         const r = n.r * 0.92, x = n.x - r, y = n.y - r, s = 2 * r, c = r * 0.35;
         ctx.moveTo(x + c, y);
         ctx.arcTo(x + s, y, x + s, y + s, c);
@@ -1146,5 +1172,10 @@
     }
   }
 
-  window.KnowledgeGraph = KnowledgeGraph;
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = KnowledgeGraph;
+  }
+  if (typeof window !== 'undefined') {
+    window.KnowledgeGraph = KnowledgeGraph;
+  }
 })();

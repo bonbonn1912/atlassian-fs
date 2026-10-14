@@ -10,7 +10,9 @@ import email.utils
 import http.client
 import json
 import logging
+import os
 import random
+import re
 import ssl
 import threading
 import time
@@ -56,7 +58,28 @@ def make_ssl_context(verify_ssl: bool, ca_bundle: str = "") -> ssl.SSLContext:
         return ctx
     if ca_bundle:
         return ssl.create_default_context(cafile=ca_bundle)
-    return ssl.create_default_context()
+    ctx = ssl.create_default_context()
+    if not ctx.cert_store_stats().get("x509_ca"):
+        # python.org builds on macOS ship without a CA store ("Install
+        # Certificates.command" not run): fall back to certifi or the system bundle.
+        for cafile in _fallback_ca_files():
+            try:
+                ctx.load_verify_locations(cafile=cafile)
+                break
+            except (OSError, ssl.SSLError):
+                continue
+    return ctx
+
+
+def _fallback_ca_files() -> list[str]:
+    files = []
+    try:
+        import certifi  # optional dependency
+        files.append(certifi.where())
+    except ImportError:
+        pass
+    files += ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"]
+    return [f for f in files if os.path.isfile(f)]
 
 
 def build_auth_headers(auth: dict | None) -> dict[str, str]:
@@ -73,6 +96,47 @@ def build_auth_headers(auth: dict | None) -> dict[str, str]:
         encoded = base64.b64encode(raw).decode("ascii")
         return {"Authorization": f"Basic {encoded}"}
     return {}
+
+
+def build_gitlab_headers(token: str | None) -> dict[str, str]:
+    """GitLab personal access token header (recommended over Bearer by GitLab)."""
+    token = (token or "").strip()
+    return {"PRIVATE-TOKEN": token} if token else {}
+
+
+# Query parameters that may carry credentials (GitLab accepts ?private_token=).
+_SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:private_token|access_token|job_token|token|password)=)[^&#\s]*")
+REDACTED = "***"
+
+
+def redact_url(url: str) -> str:
+    """Mask credential query parameters and userinfo in a URL for logs/errors."""
+    if not url:
+        return url
+    url = _SECRET_QUERY_RE.sub(lambda m: m.group(1) + REDACTED, url)
+    return re.sub(r"(?i)^(https?://)[^/@\s]+@", lambda m: m.group(1) + REDACTED + "@", url)
+
+
+def redact_secrets(text: str, secrets: Sequence[str] = ()) -> str:
+    """Remove known secret values (and credential query params) from a message."""
+    text = redact_url(str(text))
+    for secret in secrets:
+        if secret and len(secret) >= 4:
+            text = text.replace(secret, REDACTED)
+    return text
+
+
+def _header_secrets(headers: dict[str, str]) -> tuple[str, ...]:
+    """Secret parts of auth headers, e.g. the token of 'Bearer <token>'."""
+    out: list[str] = []
+    for key, value in headers.items():
+        if key.lower() in ("authorization", "private-token", "job-token") and value:
+            out.append(value)
+            parts = value.split(None, 1)
+            if len(parts) == 2:
+                out.append(parts[1])
+    return tuple(out)
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -212,6 +276,7 @@ class RateLimitedClient:
         self.budget = budget
         self.ssl_context = ssl_context
         self.auth_headers = dict(auth_headers)
+        self._secrets = _header_secrets(self.auth_headers)
         self.user_agent = user_agent
         self.max_response_bytes = int(max_response_bytes)
         self.transport = transport or default_transport(use_system_proxy=True)
@@ -231,7 +296,7 @@ class RateLimitedClient:
                     allowed = True
                     break
             if not allowed:
-                raise HostNotAllowed(f"Host nicht erlaubt für Request: {url}")
+                raise HostNotAllowed(self.redact(f"Host nicht erlaubt für Request: {url}"))
         else:
             if not s.startswith("/"):
                 s = "/" + s
@@ -250,6 +315,12 @@ class RateLimitedClient:
                 url = f"{url}{'&' if '?' in url else '?'}{qs}"
         return url
 
+    def __repr__(self) -> str:   # never expose auth headers
+        return f"RateLimitedClient(source={self.source!r}, base_url={self.base_url!r})"
+
+    def redact(self, text: str) -> str:
+        return redact_secrets(text, self._secrets)
+
     def get_json(self, path_or_url: str, params: dict | None = None) -> Any:
         data, _ = self.get_json_with_headers(path_or_url, params=params)
         return data
@@ -258,6 +329,7 @@ class RateLimitedClient:
         self, path_or_url: str, params: dict | None = None
     ) -> tuple[Any, dict[str, str]]:
         url = self._build_url(path_or_url, params=params)
+        safe_url = self.redact(url)
 
         headers = {
             "Accept": "application/json",
@@ -307,7 +379,7 @@ class RateLimitedClient:
                 self.on_event({
                     "phase": "request",
                     "source": self.source,
-                    "url": url,
+                    "url": safe_url,
                 })
 
             try:
@@ -320,7 +392,7 @@ class RateLimitedClient:
                     raise AtlassianError(
                         "TLS-Zertifikatsprüfung fehlgeschlagen – in den Einstellungen "
                         "'TLS-Zertifikate prüfen' deaktivieren oder ein CA-Bundle angeben",
-                        status=None, url=url) from exc
+                        status=None, url=safe_url) from exc
                 if attempt < self.max_retries:
                     attempt += 1
                     backoff = min(300.0, 2.0 ** attempt)
@@ -329,9 +401,9 @@ class RateLimitedClient:
                     retry_reason = "retry"
                     continue
                 raise AtlassianError(
-                    f"Netzwerkfehler nach {attempt} Wiederholungen: {exc}",
+                    self.redact(f"Netzwerkfehler nach {attempt} Wiederholungen: {exc}"),
                     status=None,
-                    url=url,
+                    url=safe_url,
                 ) from exc
 
             status = resp.status
@@ -352,7 +424,7 @@ class RateLimitedClient:
                 raise AtlassianError(
                     f"Rate Limit (HTTP 429) nach {attempt} Wiederholungen erschöpft",
                     status=429,
-                    url=url,
+                    url=safe_url,
                 )
 
             if status in (502, 503, 504):
@@ -371,33 +443,33 @@ class RateLimitedClient:
                 raise AtlassianError(
                     f"Server-Fehler (HTTP {status}) nach {attempt} Wiederholungen",
                     status=status,
-                    url=url,
+                    url=safe_url,
                 )
 
             if status == 404:
-                raise NotFoundError(f"Nicht gefunden (HTTP 404): {url}", status=404, url=url)
+                raise NotFoundError(f"Nicht gefunden (HTTP 404): {safe_url}", status=404, url=safe_url)
 
             if status in (401, 403):
                 raise ForbiddenError(
                     f"Zugriff verweigert (HTTP {status}) – Berechtigung/Token prüfen",
                     status=status,
-                    url=url,
+                    url=safe_url,
                 )
 
             if 400 <= status < 500:
-                raise AtlassianError(f"Client-Fehler (HTTP {status})", status=status, url=url)
+                raise AtlassianError(f"Client-Fehler (HTTP {status})", status=status, url=safe_url)
 
             if status >= 500:
-                raise AtlassianError(f"Server-Fehler (HTTP {status})", status=status, url=url)
+                raise AtlassianError(f"Server-Fehler (HTTP {status})", status=status, url=safe_url)
 
             if 300 <= status < 400:
-                raise AtlassianError(f"Unerwarteter Redirect (HTTP {status})", status=status, url=url)
+                raise AtlassianError(f"Unerwarteter Redirect (HTTP {status})", status=status, url=safe_url)
 
             if len(resp.body) > self.max_response_bytes:
                 raise InvalidResponseError(
                     f"Antwort überschreitet Maximalgröße von {self.max_response_bytes} Bytes",
                     status=status,
-                    url=url,
+                    url=safe_url,
                 )
 
             content_type = resp.headers.get("content-type", "").lower()
@@ -407,14 +479,14 @@ class RateLimitedClient:
                 raise ForbiddenError(
                     "Zugriff verweigert (HTML-Login-Redirect – nicht angemeldet)",
                     status=status,
-                    url=url,
+                    url=safe_url,
                 )
 
             try:
                 data = json.loads(resp.body.decode("utf-8"))
             except Exception as exc:
                 raise InvalidResponseError(
-                    f"Ungültiges JSON empfangen: {exc}", status=status, url=url
+                    self.redact(f"Ungültiges JSON empfangen: {exc}"), status=status, url=safe_url
                 ) from exc
 
             return data, resp.headers
